@@ -1,0 +1,8 @@
+stealth_requests
+requests
+bottle
+beautifulsoup4
+pillow
+discord-webhook
+yattag
+git+https://github.com/jay3332/pilmoji
