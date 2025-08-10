@@ -39,7 +39,7 @@ logging.basicConfig(format='[%(levelname)s] [%(asctime)s] %(msg)s', level=loggin
 
 
 def get_credit() -> str:
-    cred_mid: str = f'facebed by pi.kt{"🎂" if date.today().month == 12 and date.today().day == 28 else ""}'
+    cred_mid: str = f'facebed by pi.kt (Riley\'s fork) {"🎂" if date.today().month == 5 and date.today().day == 12 else ""}'
     return cred_mid
     # if minify:
     #     return cred_mid
