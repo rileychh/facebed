@@ -7,3 +7,5 @@ BANNED_USER_IDS: list[str] = [
 
 # set to None or empty string to disable
 WEBHOOK = ''
+
+USER_AGENT = None
