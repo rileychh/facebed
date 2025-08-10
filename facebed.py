@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from functools import wraps
 from typing import Self, Callable
 from urllib.parse import quote as _quote_
@@ -49,7 +49,12 @@ def quote(s: str) -> str:
     ])
 
 def get_credit() -> str:
-    return 'facebed by pi.kt'
+    cred_mid: str = f'facebed by pi.kt (Riley\'s fork) {"🎂" if date.today().month == 5 and date.today().day == 12 else ""}'
+    return cred_mid
+    # if minify:
+    #     return cred_mid
+    # cred: str = f'{cred_mid} • embed with s/book/bed'
+    # return cred
 
 
 class Utils:
