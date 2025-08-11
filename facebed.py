@@ -10,7 +10,8 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta, date
-from functools import wraps
+from functools import wraps, lru_cache
+from io import BytesIO
 from typing import Self, Callable
 from urllib.parse import quote as _quote_
 from html import escape
@@ -102,7 +103,7 @@ class Utils:
 
     @staticmethod
     def human_format(num):
-        if type(num) == int or re.match('^[0-9]+$', str(num)):
+        if num is int or re.match('^[0-9]+$', str(num)):
             num = int(num)
             num = float('{:.3g}'.format(num))
             magnitude = 0
@@ -660,7 +661,7 @@ def format_full_post_embed(post: ParsedPost) -> str:
     if post.video_links:
         return format_reel_post_embed(post)
     image_links = post.image_links
-    image_counter = f'\ncontains 4+ images' if len(image_links) > 4 else ''
+    image_counter = '\ncontains 4+ images' if len(image_links) > 4 else ''
     image_links = image_links[:4]
     image_meta_tags = '\n'.join([f'<meta property="og:image" content="{iu}"/>' for iu in image_links])
     post_date = Utils.timestamp_to_str(post.date)
@@ -688,16 +689,16 @@ def format_full_post_embed(post: ParsedPost) -> str:
 def process_post(post_path: str) -> str:
     post_path = post_path.removeprefix(WWWFB).removeprefix('/')
     parsed_post = JsonParser.process_post(post_path)
-    if type(parsed_post) == ParsedPost:
+    if isinstance(parsed_post, ParsedPost):
         return format_full_post_embed(parsed_post)
-    return format_error_message_embed(f'{WWWFB}/{post_path}')
+    return format_error_message_embed('Cannot process post', f'{WWWFB}/{post_path}')
 
 
 def process_single_photo(post_path: str) -> str:
     parsed_post = SinglePhotoParser.process_post(post_path)
-    if type(parsed_post) == ParsedPost:
+    if isinstance(parsed_post, ParsedPost):
         return format_full_post_embed(parsed_post)
-    return format_error_message_embed(f'{WWWFB}/{post_path}')
+    return format_error_message_embed('Cannot process post', f'{WWWFB}/{post_path}')
 
 
 @app.route('/<path:path>')
@@ -724,7 +725,7 @@ def index(path: str):
             video_id = search.group(1)
             path = f'reel/{video_id}'
 
-        if re.match(f'^/?reel/[0-9]+', path):
+        if re.match('^/?reel/[0-9]+', path):
             return format_reel_post_embed(ReelsParser.process_post(path))
 
         if re.match('^/*photo(\\.php)*/*$', urlparse(path).path):
@@ -754,7 +755,7 @@ def favicon():
 
 
 @app.route('/banner.png')
-def favicon():
+def banner():
     response.content_type = 'image/png'
     return static_file('banner.png', root='./assets')
 
