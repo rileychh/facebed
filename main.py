@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta, date
 from functools import wraps, lru_cache
@@ -326,7 +327,7 @@ class Story:
         all_attachments = Jq.all(post_json, 'attachment')
         for attachment_set in all_attachments:
             if any([k.endswith('subattachments') for k in attachment_set]):
-                subsets = [v for k, v in attachment_set.items() if k.endswith('subattachments')]
+                subsets = [v for k, v in attachment_set.items() if k.endswith('subattachments') and 'nodes' in v]
                 max_imgage_count = len(max(subsets, key=lambda it: len(it['nodes']))['nodes'])
                 subsets = [subset for subset in subsets if
                            len(subset['nodes']) == max_imgage_count and Jq.all(subset, 'viewer_image')]
@@ -395,7 +396,7 @@ class JsonParser:
     @staticmethod
     def get_post_json(html_parser: BeautifulSoup) -> dict:
         for json_block in JsonParser.get_json_blocks(html_parser):
-            if 'comment_rendering_instance' in json_block:  # TODO: add more robust detection
+            if 'i18n_reaction_count' in json_block:  # TODO: add more robust detection
                 bloc = json.loads(json_block)
                 assert bloc
                 return bloc
@@ -554,7 +555,7 @@ class ReelsParser:
     @staticmethod
     def get_content_node(html_parser: BeautifulSoup) -> dict:
         for json_block in JsonParser.get_json_blocks(html_parser):
-            if 'short_form_video_context' in json_block and 'creation_story' in json_block:
+            if 'browser_native_' in json_block and 'creation_story' in json_block:
                 return Jq.first(json.loads(json_block), 'creation_story')
         raise FacebedException('Invalid reels link (cn)')
 
@@ -562,7 +563,7 @@ class ReelsParser:
     def get_reaction_counts(html_parser: BeautifulSoup, is_ig: bool, video_id: str) -> tuple[str, str, str]:
         blocks: list[dict] = []
         for json_block in JsonParser.get_json_blocks(html_parser, sort=False):
-            if 'viewer_feedback_reaction_key' in json_block:
+            if 'unified_reactors' in json_block:
                 block = json.loads(json_block)
                 if any([vid == video_id for vid in Jq.all(block, 'id')]):
                     blocks.append(block)
@@ -592,18 +593,20 @@ class ReelsParser:
                                      headers=JsonParser.get_headers())
         html_parser = BeautifulSoup(http_response.text, 'html.parser')
         content_node = ReelsParser.get_content_node(html_parser)
-        sfvc = content_node['short_form_video_context']
+
+        video_meta = content_node['attachments'][0]['media']
 
         video_link = ReelsParser.get_video_link(html_parser)
-        video_id = content_node['video']['id']
-        is_ig = content_node['video']['owner']['__typename'].startswith('InstagramUser')
-        op_name = ('📷 @' if is_ig else '') + sfvc['video_owner']['username' if is_ig else 'name']
-        post_url = sfvc['shareable_url']
+        video_id = content_node['id']
+        is_ig = video_meta['owner']['__typename'].startswith('InstagramUser')
+        op_name = ('📷 @' if is_ig else '') + video_meta['owner']['username' if is_ig else 'name']
+        post_url = video_meta['shareable_url']
         post_date = content_node['creation_time']
         post_text = content_node['message']['text'] if content_node['message'] is not None else ''
+
         likes, cmts, shares = ReelsParser.get_reaction_counts(html_parser, is_ig, video_id)
 
-        if sfvc['video_owner']['id'] in user_config.BANNED_USER_IDS:
+        if video_meta['owner']['id'] in user_config.BANNED_USER_IDS:
             return banned(post_url)
 
         return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
@@ -614,7 +617,7 @@ class VideoWatchParser:
     @staticmethod
     def get_op_name(html_parser: BeautifulSoup) -> str:
         for json_block in JsonParser.get_json_blocks(html_parser, sort=False):
-            if 'is_eligible_for_subscription_gift_purchase' in json_block:
+            if 'is_additional_profile_plus' in json_block:
                 bloc = json.loads(json_block)
                 return Jq.first(bloc, 'owner')['name']
         raise FacebedException('Invalid watch link (opn)')
@@ -879,35 +882,55 @@ def index(path: str):
         use_text_mode = True
 
     if 'type' in request.query.dict and '3' in request.query.dict['type']:
-        return format_error_message_embed('images in comment are not supported', 'https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400')
+        return format_error_message_embed('images in comment are not supported', f'{WWWFB}/{path}')
 
-    if re.match('^(/)?share/v/.*', path):
-        path = Utils.resolve_share_link(path)
-        if not path:
-            return format_error_message_embed('Share link (v) redirected to nowhere.', f'{WWWFB}/{path}')
+    try:
+        if re.match('^(/)?share/v/.*', path):
+            path = Utils.resolve_share_link(path)
+            if not path:
+                return format_error_message_embed('Share link (v) redirected to nowhere.', f'{WWWFB}/{path}')
+
+        if re.match('^(/)?share/([pr]/)?[a-zA-Z0-9-._]*(/)?', path):
+            path = Utils.resolve_share_link(path)
+            if not path:
+                return format_error_message_embed('Share link redirected to nowhere.', f'{WWWFB}/{path}')
+
         search = re.search(r'/videos/(\d+)', path)
         if search:
             video_id = search.group(1)
-            path = f'watch/?v={video_id}'
+            path = f'watch?v={video_id}'
 
-    if re.match('^(/)?share/([pr]/)?[a-zA-Z0-9-._]*(/)?', path):
-        path = Utils.resolve_share_link(path)
-        if not path:
-            return format_error_message_embed('Share link redirected to nowhere.', f'{WWWFB}/{path}')
+        if re.match(f'^/?reel/[0-9]+', path):
+            return format_reel_post_embed(ReelsParser.process_post(path))
 
-    if re.match(f'^/?reel/[0-9]+', path):
-        return format_reel_post_embed(ReelsParser.process_post(path))
+        if re.match('^/*photo/*$', urlparse(path).path):
+            return process_single_photo(path, use_text_mode)
 
-    if re.match('^/*photo/*$', urlparse(path).path):
-        return process_single_photo(path, use_text_mode)
+        if re.match('^/*watch', urlparse(path).path):
+            return format_reel_post_embed(VideoWatchParser.process_post(path))
 
-    if re.match('^/*watch', urlparse(path).path):
-        return format_reel_post_embed(VideoWatchParser.process_post(path))
+        if is_facebook_url(path):
+            return process_post(path, use_text_mode)
+        else:
+            z = """This is not a Facebook link.
+You should try clicking the share -> copy link since facebed works best with /share links.
+If the /share link still fails, open an issue on 4pii4/facebed with this link.
+            """
+            return format_error_message_embed(z, 'https://github.com/4pii4/facebed')
 
-    if is_facebook_url(path):
-        return process_post(path, use_text_mode)
-    else:
-        return format_error_message_embed('This is not a Facebook link.', 'https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400')
+
+    except FacebedException:
+        print(traceback.format_exc())
+        z = '''Facebed is probably rendered outdated due to recent Facebook updates.
+You can still click on this link to get redirected to the original post.
+Please create an issue on 4pii4/facebed with this link AFTER you have confirmed that is is accessible in incognito mode.'''
+        return format_error_message_embed(z, f'{WWWFB}/{path}')
+    except Exception:
+        print(traceback.format_exc())
+        z = '''Facebed encountered an unrecoverable error.
+You can still click on this link to get redirected to the original post.
+Please create an issue on 4pii4/facebed with this link AFTER you have confirmed that is is accessible in incognito mode.'''
+        return format_error_message_embed(z, f'{WWWFB}/{path}')
 
 
 @app.route('/favicon.ico')
