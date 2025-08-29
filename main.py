@@ -13,17 +13,18 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta
 from functools import wraps, lru_cache
 from io import BytesIO
 from typing import Self, Callable
+from urllib.parse import quote as _quote_
 from urllib.parse import urlparse
 
 import requests as goofy_requests
 import stealth_requests as requests
 from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageFont import FreeTypeFont
-from bottle import Bottle, request, template, response, static_file
+from bottle import Bottle, request, response, static_file
 from bs4 import BeautifulSoup
 from discord_webhook import DiscordWebhook
 from pilmoji import Pilmoji
@@ -39,13 +40,15 @@ ALLOW_UPDATE = True
 logging.basicConfig(format='[%(levelname)s] [%(asctime)s] %(msg)s', level=logging.INFO)
 
 
+def quote(s: str) -> str:
+    return "".join([
+        _quote_(char) if char in r"<>\"#%{}[]|\\^~`" else char
+        for char in s
+    ])
+
 def get_credit() -> str:
-    cred_mid: str = f'facebed by pi.kt{"🎂" if date.today().month == 12 and date.today().day == 28 else ""}'
+    cred_mid: str = f'facebed by pi.kt'
     return cred_mid
-    # if minify:
-    #     return cred_mid
-    # cred: str = f'{cred_mid} • embed with s/book/bed'
-    # return cred
 
 
 class Utils:
@@ -659,17 +662,17 @@ class VideoWatchParser:
 
 
 def format_error_message_embed(msg: str, original_url: str) -> str:
-    return Utils.prettify(template(f'''<!DOCTYPE html>
+    return Utils.prettify(f'''<!DOCTYPE html>
 <html lang="">
 <head>
 <meta charset="UTF-8" />
     <title>{get_credit()}</title>
     <meta name="theme-color" content="#0866ff" />
     <meta property="og:title" content="{get_credit()}"/>
-    <meta property="og:description" content="{msg}"/>
-    <meta http-equiv="refresh" content="0;url={{{{original_url}}}}"/>
+    <meta property="og:description" content="{quote(msg)}"/>
+    <meta http-equiv="refresh" content="0;url={quote(original_url)}"/>
 </head>
-</html>''', original_url=original_url))
+</html>''')
 
 
 def is_facebook_url(url: str) -> bool:
@@ -756,25 +759,25 @@ def format_reel_post_embed(post: ParsedPost) -> str:
     reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
     color = '#0866ff'
 
-    return Utils.prettify(template(f'''<!DOCTYPE html>
+    return Utils.prettify(f'''<!DOCTYPE html>
         <html lang="">
         <head>
             <title>{get_credit()}</title>
             <meta charset="UTF-8"/>
-            <meta property="og:title" content="{{{{opname}}}}"/>
-            <meta property="og:site_name" content="{get_credit()}{reaction_str}"/>
-            <meta property="og:url" content="{post.url}"/>
+            <meta property="og:title" content="{quote(post.author_name)}"/>
+            <meta property="og:site_name" content="{get_credit()}{quote(reaction_str)}"/>
+            <meta property="og:url" content="{quote(post.url)}"/>
             <meta property="og:video:type" content="video/mp4"/>
             <meta property="twitter:player:stream:content_type" content="video/mp4"/>
 
             {video_meta_tags}
 
-            <link rel="canonical" href="{post.url}"/>
-            <meta http-equiv="refresh" content="0;url={post.url}"/>
+            <link rel="canonical" href="{quote(post.url)}"/>
+            <meta http-equiv="refresh" content="0;url={quote(post.url)}"/>
             <meta name="twitter:card" content="player"/>
             <meta name="theme-color" content="{color}"/>
         </head>
-        </html>''', opname=post.author_name, likes=post.likes, cmts=post.comments, shares=post.shares))
+        </html>''')
 
 
 def format_full_post_embed(post: ParsedPost) -> str:
@@ -787,24 +790,22 @@ def format_full_post_embed(post: ParsedPost) -> str:
     reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
 
     # TODO: organize and duplicate the neccessary tags
-    return Utils.prettify(template(f'''<!DOCTYPE html>
+    return Utils.prettify(f'''<!DOCTYPE html>
         <html lang="">
         <head>
             <title>{get_credit()}</title>
             <meta charset="UTF-8"/>
-            <meta property="og:title" content="{{{{opname}}}}"/>
-            <meta property="og:description" content="{{{{content}}}}"/>
-            <meta property="og:site_name" content="{get_credit()}{reaction_str}{{{{post_date}}}}{image_counter}"/>
-            <meta property="og:url" content="{post.url}"/>
+            <meta property="og:title" content="{quote(post.author_name)}"/>
+            <meta property="og:description" content="{quote(post.text[:1024])}"/>
+            <meta property="og:site_name" content="{get_credit()}{reaction_str}{Utils.timestamp_to_str(post.date)}{image_counter}"/>
+            <meta property="og:url" content="{quote(post.url)}"/>
             {image_meta_tags}
-            <link rel="canonical" href="{post.url}"/>
-            <meta http-equiv="refresh" content="0;url={post.url}"/>
+            <link rel="canonical" href="{quote(post.url)}"/>
+            <meta http-equiv="refresh" content="0;url={quote(post.url)}"/>
             <meta name="twitter:card" content="summary_large_image"/>
             <meta name="theme-color" content="#0866ff"/>
         </head>
-        </html>''', opname=post.author_name, content=post.text[:1024],
-                    likes=post.likes, cmts=post.comments, shares=post.shares,
-                    post_date=Utils.timestamp_to_str(post.date)))
+        </html>''')
 
 
 def format_text_post_embed(post: ParsedPost) -> str:
@@ -817,22 +818,21 @@ def format_text_post_embed(post: ParsedPost) -> str:
 
     reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
 
-    return template(f'''<!DOCTYPE html>
+    return f'''<!DOCTYPE html>
     <html lang="">
     <head>
         <title>{get_credit()}</title>
         <meta charset="UTF-8"/>
-        <meta property="og:title" content="{{{{opname}}}}"/>
+        <meta property="og:title" content="{quote(post.author_name)}"/>
         <meta property="og:site_name" content="{get_credit()}{reaction_str}{{{{post_date}}}}"/>
-        <meta property="og:url" content="{post.url}"/>
+        <meta property="og:url" content="{quote(post.url)}"/>
         <meta property="og:image" content="/txtimg/{img_index}-{iid}.png"/>
-        <link rel="canonical" href="{post.url}"/>
-        <meta http-equiv="refresh" content="0;url={post.url}"/>
+        <link rel="canonical" href="{quote(post.url)}"/>
+        <meta http-equiv="refresh" content="0;url={quote(post.url)}"/>
         <meta content="summary_large_image" name="twitter:card"/>
         <meta name="theme-color" content="#0866ff"/>
     </head>
-    </html>''', opname=post.author_name, likes=post.likes, cmts=post.comments, shares=post.shares,
-                    post_date=Utils.timestamp_to_str(post.date))
+    </html>'''
 
 
 def process_post(post_path: str, text_mode: bool) -> str:
