@@ -47,8 +47,7 @@ def quote(s: str) -> str:
     ])
 
 def get_credit() -> str:
-    cred_mid: str = f'facebed by pi.kt'
-    return cred_mid
+    return 'facebed by pi.kt'
 
 
 class Utils:
@@ -416,7 +415,7 @@ class JsonParser:
         return ''
 
     @staticmethod
-    def get_interaction_counts(post_json: dict) -> [str, str, str]:
+    def get_interaction_counts(post_json: dict) -> tuple[str, str, str]:
         assert post_json
         post_feedback = Jq.first(post_json, 'comet_ufi_summary_and_actions_renderer')
         assert post_feedback
@@ -914,22 +913,22 @@ def index(path: str):
         else:
             z = """This is not a Facebook link.
 You should try clicking the share -> copy link since facebed works best with /share links.
-If the /share link still fails, open an issue on 4pii4/facebed with this link.
+If the /share link still fails, open an issue on git.facebed.com with this link.
             """
-            return format_error_message_embed(z, 'https://github.com/4pii4/facebed')
+            return format_error_message_embed(z, 'https://git.facebed.com')
 
 
     except FacebedException:
         print(traceback.format_exc())
         z = '''Facebed is probably rendered outdated due to recent Facebook updates.
 You can still click on this link to get redirected to the original post.
-Please create an issue on 4pii4/facebed with this link AFTER you have confirmed that is is accessible in incognito mode.'''
+Please create an issue on git.facebed.com with this link AFTER you have confirmed that is is accessible in incognito mode.'''
         return format_error_message_embed(z, f'{WWWFB}/{path}')
     except Exception:
         print(traceback.format_exc())
         z = '''Facebed encountered an unrecoverable error.
 You can still click on this link to get redirected to the original post.
-Please create an issue on 4pii4/facebed with this link AFTER you have confirmed that is is accessible in incognito mode.'''
+Please create an issue on git.facebed.com with this link AFTER you have confirmed that is is accessible in incognito mode.'''
         return format_error_message_embed(z, f'{WWWFB}/{path}')
 
 
