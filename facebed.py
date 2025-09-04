@@ -1,37 +1,38 @@
 import argparse
-import concurrent.futures
-import datetime
-import hashlib
+import io
 import json
 import logging
 import os
-import random
 import re
-import subprocess
 import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from functools import wraps, lru_cache
-from io import BytesIO
+from functools import wraps
 from typing import Self, Callable
 from urllib.parse import quote as _quote_
 from urllib.parse import urlparse
 
 import requests as goofy_requests
 import stealth_requests as requests
-from PIL import Image, ImageDraw, ImageFont
-from PIL.ImageFont import FreeTypeFont
+import yaml
 from bottle import Bottle, request, response, static_file
 from bs4 import BeautifulSoup
 from discord_webhook import DiscordWebhook
-from pilmoji import Pilmoji
 from yattag import indent
 
-import user_config
+CONFIG_STR = '''
+host: 0.0.0.0
+port: 9812
+timezone: 7
+banned_users: []
+banned_notifier_webhook: ''
+'''.strip()
 
+config: dict = {}
+default_config: dict = yaml.safe_load(io.StringIO(CONFIG_STR))
 app: Bottle = Bottle()
 
 WWWFB = 'https://www.facebook.com'
@@ -67,13 +68,13 @@ class Utils:
             'upgrade-insecure-requests': '1',
             'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
         }
-        headers.update(Utils.get_ua())
 
         # cookies not needed to resolve share links
         head_request = goofy_requests.head(f'{WWWFB}/{path}', headers=headers)
         if head_request.next is None or head_request.next.url.startswith('https://www.facebook.com/share'):
             return ''
         path = head_request.next.url.removeprefix(f'{WWWFB}/')
+        # print(path)
         return path
 
 
@@ -82,19 +83,16 @@ class Utils:
         return indent(txt, indentation ='    ', newline = '\n', indent_text = True)
 
     @staticmethod
-    def get_ua() -> dict:
-        if user_config.USER_AGENT:
-            return {'user-agent': user_config.USER_AGENT}
-        else:
-            return {}
-
-    @staticmethod
     def warn(msg: str):
         def worker():
-            if user_config.BANNED_USER_IDS is None:
+            wh = config['banned_notifier_webhook']
+            if not wh or not wh.startswith('https://discord.com/api/webhooks/'):
                 return
-            webhook = DiscordWebhook(url=user_config.WEBHOOK, content=msg)
-            webhook.execute()
+            try:
+                webhook = DiscordWebhook(url=config['banned_notifier_webhook'], content=msg)
+                webhook.execute()
+            except Exception:
+                logging.warning(f'failed to warn about "{msg}"')
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -107,9 +105,9 @@ class Utils:
     def timestamp_to_str(ts: int) -> str:
         if ts < 0:
             return ''
-        dt = datetime.fromtimestamp(ts, timezone(timedelta(hours=TZ_OFFSET)))
+        dt = datetime.fromtimestamp(ts, timezone(timedelta(hours=config['timezone'])))
         tztext = dt.strftime('%z')[:3]
-        return ' • ' + dt.strftime('%Y/%m/%d %H:%M:%S ') + f'UTC{tztext}'
+        return '⌚ ' + dt.strftime('%Y/%m/%d %H:%M:%S ') + f'UTC{tztext}'
 
     @staticmethod
     def human_format(num):
@@ -130,19 +128,7 @@ class Utils:
         cmts_str = f'💬 {cmts}' if cmts != 'null' else ''
         shares_str = f'🔁 {shares}' if shares != 'null' else ''
         fmt = ' • '.join([x for x in [likes_str, cmts_str, shares_str] if x]).replace(',', '.')
-        if fmt:
-            fmt = '\n' + fmt
         return fmt
-
-    @staticmethod
-    def parallel_map(lst, func) -> dict:
-        parallel_results = {}
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            f = {executor.submit(func, i): i for i in lst}
-            for future in concurrent.futures.as_completed(f):
-                k = f[future]
-                parallel_results[k] = future.result()
-        return parallel_results
 
 
 class Jq:
@@ -200,45 +186,12 @@ class Jq:
         return Jq.iterate(obj, key)[-1]
 
 
-class Cache:
-    db = []
-    limit: int = 64  # to be determined with actual testing
-    index: int = 0
-
-    @staticmethod
-    def put(imgid: str, image: Image) -> int:
-        if not Cache.db:
-            [Cache.db.append([None, None]) for _ in range(Cache.limit)]
-        Cache.db[Cache.index][0] = imgid
-        Cache.db[Cache.index][1] = image
-
-        oi = Cache.index
-        Cache.index += 1
-        if Cache.index >= Cache.limit:
-            Cache.index = 0
-
-        return oi
-
-    @staticmethod
-    def get(imgfilename: str) -> Image:
-        ii = imgfilename.split('-')
-        if len(ii) != 2:
-            return None
-        imgindex, imgid = ii
-        if not re.match('^[0-9]+$', imgindex):
-            return None
-        imgindex = int(imgindex)
-        if None in Cache.db[imgindex] or Cache.db[imgindex][0] != imgid:
-            return None
-        return Cache.db[imgindex][1]
-
-
 class Cookies:
     def __init__(self, fn: str):
         self.cookies: list = []
 
         if not os.path.isfile(fn):
-            logging.warning('cookies.json not found, random shit will NOT work')
+            logging.warning('cookies.json not found, non incognito-viewable posts will NOT work')
             return
 
         with open(fn) as f:
@@ -258,24 +211,6 @@ class Cookies:
 
 
 acc = Cookies('cookies.json')
-
-
-class Auth:
-    @staticmethod
-    @lru_cache()
-    def get_credentials():
-        username = os.getenv('FACEBED_USERNAME')
-        password_hash = os.getenv('FACEBED_PASSWORD_HASH')
-
-        if not username or not password_hash:
-            username = user_config.USERNAME
-            password_hash = hashlib.sha256(user_config.PASSWORD.encode()).hexdigest()
-
-        return username, password_hash
-
-    @staticmethod
-    def check_auth(username, password):
-        return (username, hashlib.sha256(password.encode()).hexdigest()) == Auth.get_credentials()
 
 
 class Story:
@@ -384,7 +319,6 @@ class JsonParser:
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Sec-Fetch-Site': 'none'
         }
-        headers.update(Utils.get_ua())
         return headers
 
 
@@ -479,7 +413,7 @@ class JsonParser:
         post_author_name = story.author_name
         link_header = f'{post_author_name}' + (f' • {post_group_name}' if post_group_name else '')
 
-        if story.author_id in user_config.BANNED_USER_IDS:
+        if story.author_id in config['banned_users']:
             return banned(post_url)
 
         # TODO: support normal /watch here
@@ -608,7 +542,7 @@ class ReelsParser:
 
         likes, cmts, shares = ReelsParser.get_reaction_counts(html_parser, is_ig, video_id)
 
-        if video_meta['owner']['id'] in user_config.BANNED_USER_IDS:
+        if video_meta['owner']['id'] in config['banned_users']:
             return banned(post_url)
 
         return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
@@ -689,63 +623,6 @@ def is_facebook_url(url: str) -> bool:
     return is_permalink or is_post or is_story or is_photo or is_group_post
 
 
-@lru_cache
-def get_font_renderer() -> FreeTypeFont:
-    try:
-        font_renderer = ImageFont.truetype(os.path.join(os.path.dirname(__file__), 'text_mode_assets', 'SFProDisplay-Medium.ttf'), 20)
-    except IOError:
-        font_renderer = ImageFont.load_default()
-    return font_renderer
-
-
-def render_text_mode_post(post_text: str) -> Image:
-    start_time = time.time()
-    canvas_width = 400 if len(post_text) <= 200 else 800
-    margin = 20
-    background_color = (24, 25, 26)
-    text_color = (228, 230, 235)
-
-    font_text = get_font_renderer()
-
-    # -- Measure and wrap the post text
-    temp_image = Image.new('RGB', (canvas_width, 100), background_color)
-    temp_draw = ImageDraw.Draw(temp_image)
-
-    max_text_width = canvas_width - 2 * margin
-    wrapped_text = []
-    for line in post_text.split('\n'):
-        words = line.split(' ')
-        current_line = ''
-        for word in words:
-            test_line = f'{current_line} {word}'.strip()
-            text_bbox = temp_draw.textbbox((0, 0), test_line, font=font_text)
-            text_width = text_bbox[2] - text_bbox[0]
-            if text_width <= max_text_width:
-                current_line = test_line
-            else:
-                wrapped_text.append(current_line)
-                current_line = word
-        wrapped_text.append(current_line)
-    wrapped_text = '\n'.join(wrapped_text)
-
-    # -- Calculate dynamic height
-    text_bbox = temp_draw.multiline_textbbox((0, 0), wrapped_text, font=font_text)
-    text_height = text_bbox[3] - text_bbox[1]
-    canvas_height = int(text_height + 2 * margin)
-
-    # -- Create canvas
-    canvas = Image.new('RGB', (canvas_width, canvas_height), background_color)
-
-    # -- Post content
-    text_x = margin
-    text_y = margin
-    with Pilmoji(canvas) as pilmoji:
-        pilmoji.text((text_x, text_y), wrapped_text, font=font_text, fill=text_color)
-
-    logging.info(f'took {round(time.time() - start_time, 2)} seconds to render {len(post_text)} characters')
-    return canvas
-
-
 def format_reel_post_embed(post: ParsedPost) -> str:
     def get_video_meta_tag(link: str) -> str:
         return '\n'.join([
@@ -756,6 +633,7 @@ def format_reel_post_embed(post: ParsedPost) -> str:
 
     video_meta_tags = '\n'.join([get_video_meta_tag(vu) for vu in post.video_links])
     reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
+    post_date = Utils.timestamp_to_str(post.date)
     color = '#0866ff'
 
     return Utils.prettify(f'''<!DOCTYPE html>
@@ -764,7 +642,7 @@ def format_reel_post_embed(post: ParsedPost) -> str:
             <title>{get_credit()}</title>
             <meta charset="UTF-8"/>
             <meta property="og:title" content="{quote(post.author_name)}"/>
-            <meta property="og:site_name" content="{get_credit()}{quote(reaction_str)}"/>
+            <meta property="og:site_name" content="{get_credit()}\n{post_date}\n{reaction_str}"/>
             <meta property="og:url" content="{quote(post.url)}"/>
             <meta property="og:video:type" content="video/mp4"/>
             <meta property="twitter:player:stream:content_type" content="video/mp4"/>
@@ -786,6 +664,7 @@ def format_full_post_embed(post: ParsedPost) -> str:
     image_counter = f'\ncontains 4+ images' if len(image_links) > 4 else ''
     image_links = image_links[:4]
     image_meta_tags = '\n'.join([f'<meta property="og:image" content="{iu}"/>' for iu in image_links])
+    post_date = Utils.timestamp_to_str(post.date)
     reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
 
     # TODO: organize and duplicate the neccessary tags
@@ -796,7 +675,7 @@ def format_full_post_embed(post: ParsedPost) -> str:
             <meta charset="UTF-8"/>
             <meta property="og:title" content="{quote(post.author_name)}"/>
             <meta property="og:description" content="{quote(post.text[:1024])}"/>
-            <meta property="og:site_name" content="{get_credit()}{reaction_str}{Utils.timestamp_to_str(post.date)}{image_counter}"/>
+            <meta property="og:site_name" content="{get_credit()}\n{post_date}\n{reaction_str}{image_counter}"/>
             <meta property="og:url" content="{quote(post.url)}"/>
             {image_meta_tags}
             <link rel="canonical" href="{quote(post.url)}"/>
@@ -807,78 +686,25 @@ def format_full_post_embed(post: ParsedPost) -> str:
         </html>''')
 
 
-def format_text_post_embed(post: ParsedPost) -> str:
-    def ll():
-        return ''.join([random.choice(['l', 'I']) for _ in range(32)])
-
-    text_mode_image = render_text_mode_post(post_text=post.text.strip())
-    iid = ll()
-    img_index = Cache.put(iid, text_mode_image)
-
-    reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
-
-    return f'''<!DOCTYPE html>
-    <html lang="">
-    <head>
-        <title>{get_credit()}</title>
-        <meta charset="UTF-8"/>
-        <meta property="og:title" content="{quote(post.author_name)}"/>
-        <meta property="og:site_name" content="{get_credit()}{reaction_str}{{{{post_date}}}}"/>
-        <meta property="og:url" content="{quote(post.url)}"/>
-        <meta property="og:image" content="/txtimg/{img_index}-{iid}.png"/>
-        <link rel="canonical" href="{quote(post.url)}"/>
-        <meta http-equiv="refresh" content="0;url={quote(post.url)}"/>
-        <meta content="summary_large_image" name="twitter:card"/>
-        <meta name="theme-color" content="#0866ff"/>
-    </head>
-    </html>'''
-
-
-def process_post(post_path: str, text_mode: bool) -> str:
+def process_post(post_path: str) -> str:
     post_path = post_path.removeprefix(WWWFB).removeprefix('/')
     parsed_post = JsonParser.process_post(post_path)
     if type(parsed_post) == ParsedPost:
-        if text_mode:
-            return format_text_post_embed(parsed_post)
-        else:
-            return format_full_post_embed(parsed_post)
-    else:
-        return format_error_message_embed('Cannot process post', f'{WWWFB}/{post_path}')
-
-
-def process_single_photo(post_path: str, text_mode: bool) -> str:
-    parsed_post = SinglePhotoParser.process_post(post_path)
-    if type(parsed_post) == ParsedPost:
-        if text_mode:
-            return format_text_post_embed(parsed_post)
-        else:
-            return format_full_post_embed(parsed_post)
+        return format_full_post_embed(parsed_post)
     return format_error_message_embed('Cannot process post', f'{WWWFB}/{post_path}')
 
 
-@app.route('/txtimg/<path:path>')
-def txtimg(path: str):
-    imgid = path
-    image = Cache.get(imgid.removesuffix('.png'))
-    if image is None:
-        response.status = 404
-        return 'invalid request'
-
-    bytes_array = BytesIO()
-    image.save(bytes_array, format='PNG', quality=100)
-    response.content_type = 'image/png'
-    response.set_header('Cache-Control', f'public, max-age={int(timedelta(hours=24).total_seconds())}')
-    return bytes_array.getvalue()
+def process_single_photo(post_path: str) -> str:
+    parsed_post = SinglePhotoParser.process_post(post_path)
+    if type(parsed_post) == ParsedPost:
+        return format_full_post_embed(parsed_post)
+    return format_error_message_embed('Cannot process post', f'{WWWFB}/{post_path}')
 
 
 @app.route('/<path:path>')
 def index(path: str):
     if request.query_string:
         path += f'?{request.query_string}'
-    use_text_mode = False
-    if path.endswith('/text'):
-        path = path.removesuffix('/text')
-        use_text_mode = True
 
     if 'type' in request.query.dict and '3' in request.query.dict['type']:
         return format_error_message_embed('images in comment are not supported', f'{WWWFB}/{path}')
@@ -894,22 +720,22 @@ def index(path: str):
             if not path:
                 return format_error_message_embed('Share link redirected to nowhere.', f'{WWWFB}/{path}')
 
-        search = re.search(r'/videos/(\d+)', path)
+        search = re.search(r'/videos/(\d+).*', path)
         if search:
             video_id = search.group(1)
-            path = f'watch?v={video_id}'
+            path = f'reel/{video_id}'
 
         if re.match(f'^/?reel/[0-9]+', path):
             return format_reel_post_embed(ReelsParser.process_post(path))
 
         if re.match('^/*photo/*$', urlparse(path).path):
-            return process_single_photo(path, use_text_mode)
+            return process_single_photo(path)
 
         if re.match('^/*watch', urlparse(path).path):
             return format_reel_post_embed(VideoWatchParser.process_post(path))
 
         if is_facebook_url(path):
-            return process_post(path, use_text_mode)
+            return process_post(path)
         else:
             z = """This is not a Facebook link.
 You should try clicking the share -> copy link since facebed works best with /share links.
@@ -944,39 +770,6 @@ def favicon():
     return static_file('banner.png', root='./assets')
 
 
-@app.route('/update')
-def update():
-    def get_commit_id() -> str:
-        return subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD']).decode('utf-8').strip()
-
-    def run_start_command():
-        time.sleep(1)
-        from start import START_COMMANDS
-        for command in START_COMMANDS[:-1]:
-            subprocess.run(command)
-        os.execv(START_COMMANDS[-1][0], START_COMMANDS[-1])
-
-    if not user_config.ENABLE_REMOTE_UPDATER:
-        logging.info('update disabled')
-        response.status = 401
-        return 'remote updating disabled'
-
-    auth = request.auth
-    if auth and Auth.check_auth(auth[0], auth[1]):
-        logging.info('update request authenticated')
-        old_commit_id = get_commit_id()
-        subprocess.run(['git', 'pull'])
-        new_commit_id = get_commit_id()
-        threading.Thread(target=run_start_command, daemon=True).start()
-        return f'updating from <code>{old_commit_id}</code> to <code>{new_commit_id}</code>'
-    else:
-        logging.error('update request not authenticated')
-        time.sleep(random.randint(100, 1000) / 1000)
-        response.status = 401
-        response.headers['WWW-Authenticate'] = 'Basic realm="Login Required"'
-        return 'Access Denied: Can\'t remotely update facebed!'
-
-
 @app.route('/')
 def root():
     with open('assets/index.html', encoding='utf-8') as f:
@@ -994,29 +787,43 @@ def log_to_logger(fn):
 
 
 def main():
-    global TZ_OFFSET
+    global config
 
     parser = argparse.ArgumentParser(description='Facebook embed server')
-    parser.add_argument('-p', '--port', type=int, default=9812, help='port number')
-    parser.add_argument('-H', '--host', default='0.0.0.0', help='host address')
-    parser.add_argument('-z', '--timezone', required=True, type=int, help='time zone offset')
+    parser.add_argument('-c', '--config', type=str, help='config yaml file path')
     args = parser.parse_args()
 
-    TZ_OFFSET = args.timezone
-    if TZ_OFFSET < -12 or TZ_OFFSET > 14:
+    if args.config:
+        if not os.path.isfile(args.config):
+            logging.error(f'config file {args.config} not found or is not a file')
+            exit(1)
+        if not os.access(args.config, os.R_OK):
+            logging.error(f'config file {args.config} not readable')
+            exit(1)
+
+        with open(args.config, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        for dk in default_config:
+            if dk not in config:
+                config[dk] = default_config[dk]
+        for k in config:
+            if k not in default_config or type(config[k]) != type(default_config[k]):
+                logging.error(f'invalid config entry {k}')
+                exit(1)
+    else:
+        config = default_config
+
+    if config['timezone'] < -12 or config['timezone'] > 14:
         logging.critical('invalid timezone offset')
         exit(1)
-
-    if not user_config.ENABLE_REMOTE_UPDATER:
-        logging.info('disabling remote update')
 
     if sys.version_info.minor < 12:
         logging.error('python 3.12+ required, see https://docs.python.org/3.12/whatsnew/3.12.html#pep-701-syntactic-formalization-of-f-strings')
         exit(1)
 
-    logging.info(f'listening on {args.host}:{args.port}')
+    logging.info(f'listening on {config['host']}:{config['port']}')
     app.install(log_to_logger)
-    app.run(host=args.host, port=args.port, quiet=True)
+    app.run(host=config['host'], port=config['port'], quiet=True)
 
 
 if __name__ == '__main__':

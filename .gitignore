@@ -158,15 +158,6 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
-
-# do not fetch credentials file
-credentials.json
-
-# do not fetch restart command
-start.py
-
-# debug and temp_render files
-temp_render/*.jpg
 debug.*
 
 # macOS bullshit
@@ -174,4 +165,3 @@ debug.*
 
 cookies.txt
 cookies.json
-user_config.py
