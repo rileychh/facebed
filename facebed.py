@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from typing import Self, Callable
 from urllib.parse import quote as _quote_
+from html import escape
 from urllib.parse import urlparse
 
 import requests as goofy_requests
@@ -43,7 +44,7 @@ logging.basicConfig(format='[%(levelname)s] [%(asctime)s] %(msg)s', level=loggin
 
 def quote(s: str) -> str:
     return "".join([
-        _quote_(char) if char in r"<>\"#%{}[]|\\^~`" else char
+        _quote_(char) if char in r"<>\"'#%{}[]|\\^~`" else char
         for char in s
     ])
 
@@ -602,7 +603,7 @@ def format_error_message_embed(msg: str, original_url: str) -> str:
     <title>{get_credit()}</title>
     <meta name="theme-color" content="#0866ff" />
     <meta property="og:title" content="{get_credit()}"/>
-    <meta property="og:description" content="{quote(msg)}"/>
+    <meta property="og:description" content="{escape(msg)}"/>
     <meta http-equiv="refresh" content="0;url={quote(original_url)}"/>
 </head>
 </html>''')
@@ -641,7 +642,7 @@ def format_reel_post_embed(post: ParsedPost) -> str:
         <head>
             <title>{get_credit()}</title>
             <meta charset="UTF-8"/>
-            <meta property="og:title" content="{quote(post.author_name)}"/>
+            <meta property="og:title" content="{escape(post.author_name)}"/>
             <meta property="og:site_name" content="{get_credit()}\n{post_date}\n{reaction_str}"/>
             <meta property="og:url" content="{quote(post.url)}"/>
             <meta property="og:video:type" content="video/mp4"/>
@@ -673,8 +674,8 @@ def format_full_post_embed(post: ParsedPost) -> str:
         <head>
             <title>{get_credit()}</title>
             <meta charset="UTF-8"/>
-            <meta property="og:title" content="{quote(post.author_name)}"/>
-            <meta property="og:description" content="{quote(post.text[:1024])}"/>
+            <meta property="og:title" content="{escape(post.author_name)}"/>
+            <meta property="og:description" content="{escape(post.text[:1024])}"/>
             <meta property="og:site_name" content="{get_credit()}\n{post_date}\n{reaction_str}{image_counter}"/>
             <meta property="og:url" content="{quote(post.url)}"/>
             {image_meta_tags}
