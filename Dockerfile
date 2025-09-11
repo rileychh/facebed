@@ -1,5 +1,5 @@
 FROM python:3.13-alpine AS builder
-RUN apk add --no-cache gcc libffi-dev
+RUN apk add --no-cache gcc libffi-dev musl-dev
 WORKDIR /app
 COPY requirements.txt .
 RUN pip3.13 install -r ./requirements.txt
