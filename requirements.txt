@@ -1,8 +1,7 @@
 stealth_requests
-requests
-bottle
-beautifulsoup4
-pillow
-discord-webhook
-yattag
-git+https://github.com/jay3332/pilmoji
+requests~=2.32.3
+bottle~=0.13.2
+beautifulsoup4~=4.13.3
+discord-webhook~=1.4.1
+yattag~=1.16.1
+PyYAML~=6.0.2

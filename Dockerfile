@@ -1,12 +1,13 @@
-FROM python:3.13-alpine
-COPY --from=ghcr.io/astral-sh/uv:0.8.8 /uv /uvx /bin/
-
-RUN apk add --no-cache git
-
+FROM python:3.13-alpine AS builder
 WORKDIR /app
-COPY user_config.example.py user_config.py
+COPY requirements.txt .
+RUN pip3.13 install -r ./requirements.txt
+
+FROM python:3.13-alpine
+WORKDIR /facebed
 COPY . .
-
-RUN uv pip install --system --no-cache-dir -r requirements.txt
-
-CMD ["python", "main.py", "--timezone=8"]
+RUN /bin/sh -c "echo '{}' > ./config.yaml"
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+RUN adduser -D facebed
+USER facebed
+CMD ["python3.13", "./facebed.py", "-c", "./config.yaml"]
