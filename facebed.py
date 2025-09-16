@@ -17,6 +17,7 @@ from html import escape
 from urllib.parse import urlparse
 
 import stealth_requests as requests
+import requests as rq
 import yaml
 from bottle import Bottle, request, response, static_file
 from bs4 import BeautifulSoup
@@ -55,7 +56,7 @@ class Utils:
     @staticmethod
     def resolve_share_link(path: str) -> str:
         # cookies not needed to resolve share links
-        head_request = requests.head(f'{WWWFB}/{path}', headers=JsonParser.get_headers())
+        head_request = rq.head(f'{WWWFB}/{path}', headers=JsonParser.get_headers())
         if head_request.next is None or head_request.next.url.startswith('https://www.facebook.com/share'):
             return ''
         path = head_request.next.url.removeprefix(f'{WWWFB}/')
