@@ -16,8 +16,7 @@ from urllib.parse import quote as _quote_
 from html import escape
 from urllib.parse import urlparse
 
-import requests as goofy_requests
-import stealth_requests as requests
+import requests
 import yaml
 from bottle import Bottle, request, response, static_file
 from bs4 import BeautifulSoup
@@ -55,23 +54,8 @@ def get_credit() -> str:
 class Utils:
     @staticmethod
     def resolve_share_link(path: str) -> str:
-        headers = {
-            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'accept-language': 'en-US,en;q=0.9',
-            'cache-control': 'no-cache',
-            'pragma': 'no-cache',
-            'priority': 'u=0, i',
-            'referer': 'https://www.google.com/',
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'same-origin',
-            'sec-fetch-user': '?1',
-            'upgrade-insecure-requests': '1',
-            'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
-        }
-
         # cookies not needed to resolve share links
-        head_request = goofy_requests.head(f'{WWWFB}/{path}', headers=headers)
+        head_request = requests.head(f'{WWWFB}/{path}', headers=JsonParser.get_headers())
         if head_request.next is None or head_request.next.url.startswith('https://www.facebook.com/share'):
             return ''
         path = head_request.next.url.removeprefix(f'{WWWFB}/')
@@ -316,9 +300,23 @@ class FacebedException(Exception):
 class JsonParser:
     @staticmethod
     def get_headers() -> dict:
-        headers =  {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Sec-Fetch-Site': 'none'
+        headers = {
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'accept-language': 'en-US,en;q=0.9',
+            'cache-control': 'no-cache',
+            'dnt': '1',
+            'pragma': 'no-cache',
+            'priority': 'u=0, i',
+            'sec-ch-ua': '"Not?A_Brand";v="99", "Chromium";v="130"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'document',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'none',
+            'sec-fetch-user': '?1',
+            'sec-gpc': '1',
+            'upgrade-insecure-requests': '1',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
         }
         return headers
 
@@ -737,24 +735,14 @@ def index(path: str):
         if is_facebook_url(path):
             return process_post(path)
         else:
-            z = """This is not a Facebook link.
-You should try clicking the share -> copy link since facebed works best with /share links.
-If the /share link still fails, open an issue on git.facebed.com with this link.
-            """
             return format_error_message_embed('https://git.facebed.com')
 
 
     except FacebedException:
         print(traceback.format_exc())
-        z = '''Facebed is probably rendered outdated due to recent Facebook updates.
-You can still click on this link to get redirected to the original post.
-Please create an issue on git.facebed.com with this link AFTER you have confirmed that is is accessible in incognito mode.'''
         return format_error_message_embed(f'{WWWFB}/{path}')
     except Exception:
         print(traceback.format_exc())
-        z = '''Facebed encountered an unrecoverable error.
-You can still click on this link to get redirected to the original post.
-Please create an issue on git.facebed.com with this link AFTER you have confirmed that is is accessible in incognito mode.'''
         return format_error_message_embed(f'{WWWFB}/{path}')
 
 
