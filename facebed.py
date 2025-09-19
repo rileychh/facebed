@@ -16,8 +16,8 @@ from urllib.parse import quote as _quote_
 from html import escape
 from urllib.parse import urlparse
 
-import requests as goofy_requests
 import stealth_requests as requests
+import requests as rq
 import yaml
 from bottle import Bottle, request, response, static_file
 from bs4 import BeautifulSoup
@@ -55,23 +55,8 @@ def get_credit() -> str:
 class Utils:
     @staticmethod
     def resolve_share_link(path: str) -> str:
-        headers = {
-            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'accept-language': 'en-US,en;q=0.9',
-            'cache-control': 'no-cache',
-            'pragma': 'no-cache',
-            'priority': 'u=0, i',
-            'referer': 'https://www.google.com/',
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'same-origin',
-            'sec-fetch-user': '?1',
-            'upgrade-insecure-requests': '1',
-            'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
-        }
-
         # cookies not needed to resolve share links
-        head_request = goofy_requests.head(f'{WWWFB}/{path}', headers=headers)
+        head_request = rq.head(f'{WWWFB}/{path}', headers=JsonParser.get_headers())
         if head_request.next is None or head_request.next.url.startswith('https://www.facebook.com/share'):
             return ''
         path = head_request.next.url.removeprefix(f'{WWWFB}/')
@@ -316,10 +301,16 @@ class FacebedException(Exception):
 class JsonParser:
     @staticmethod
     def get_headers() -> dict:
-        headers =  {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Sec-Fetch-Site': 'none'
+        headers = {
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'accept-language': 'en-US,en;q=0.9',
+            'cache-control': 'no-cache',
+            'pragma': 'no-cache',
+            'priority': 'u=0, i',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'none',
         }
+
         return headers
 
 
@@ -595,15 +586,14 @@ class VideoWatchParser:
         return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
 
 
-def format_error_message_embed(msg: str, original_url: str) -> str:
+def format_error_message_embed(original_url: str) -> str:
     return Utils.prettify(f'''<!DOCTYPE html>
 <html lang="">
 <head>
 <meta charset="UTF-8" />
-    <title>{get_credit()}</title>
-    <meta name="theme-color" content="#0866ff" />
-    <meta property="og:title" content="{get_credit()}"/>
-    <meta property="og:description" content="{escape(msg)}"/>
+    <meta name="theme-color" content="#2c3048f" />
+    <meta property="og:title" content="Log in or sign up to view"/>
+    <meta property="og:description" content="See posts, photos and more on Facebook.\nIf viewable in incognito report to git.facebed.com."/>
     <meta http-equiv="refresh" content="0;url={quote(original_url)}"/>
 </head>
 </html>''')
@@ -692,14 +682,14 @@ def process_post(post_path: str) -> str:
     parsed_post = JsonParser.process_post(post_path)
     if type(parsed_post) == ParsedPost:
         return format_full_post_embed(parsed_post)
-    return format_error_message_embed('Cannot process post', f'{WWWFB}/{post_path}')
+    return format_error_message_embed(f'{WWWFB}/{post_path}')
 
 
 def process_single_photo(post_path: str) -> str:
     parsed_post = SinglePhotoParser.process_post(post_path)
     if type(parsed_post) == ParsedPost:
         return format_full_post_embed(parsed_post)
-    return format_error_message_embed('Cannot process post', f'{WWWFB}/{post_path}')
+    return format_error_message_embed(f'{WWWFB}/{post_path}')
 
 
 @app.route('/<path:path>')
@@ -708,18 +698,18 @@ def index(path: str):
         path += f'?{request.query_string}'
 
     if 'type' in request.query.dict and '3' in request.query.dict['type']:
-        return format_error_message_embed('images in comment are not supported', f'{WWWFB}/{path}')
+        return format_error_message_embed(f'{WWWFB}/{path}')
 
     try:
         if re.match('^(/)?share/v/.*', path):
             path = Utils.resolve_share_link(path)
             if not path:
-                return format_error_message_embed('Share link (v) redirected to nowhere.', f'{WWWFB}/{path}')
+                return format_error_message_embed(f'{WWWFB}/{path}')
 
         if re.match('^(/)?share/([pr]/)?[a-zA-Z0-9-._]*(/)?', path):
             path = Utils.resolve_share_link(path)
             if not path:
-                return format_error_message_embed('Share link redirected to nowhere.', f'{WWWFB}/{path}')
+                return format_error_message_embed(f'{WWWFB}/{path}')
 
         search = re.search(r'/videos/(\d+).*', path)
         if search:
@@ -738,25 +728,15 @@ def index(path: str):
         if is_facebook_url(path):
             return process_post(path)
         else:
-            z = """This is not a Facebook link.
-You should try clicking the share -> copy link since facebed works best with /share links.
-If the /share link still fails, open an issue on git.facebed.com with this link.
-            """
-            return format_error_message_embed(z, 'https://git.facebed.com')
+            return format_error_message_embed('https://git.facebed.com')
 
 
     except FacebedException:
         print(traceback.format_exc())
-        z = '''Facebed is probably rendered outdated due to recent Facebook updates.
-You can still click on this link to get redirected to the original post.
-Please create an issue on git.facebed.com with this link AFTER you have confirmed that is is accessible in incognito mode.'''
-        return format_error_message_embed(z, f'{WWWFB}/{path}')
+        return format_error_message_embed(f'{WWWFB}/{path}')
     except Exception:
         print(traceback.format_exc())
-        z = '''Facebed encountered an unrecoverable error.
-You can still click on this link to get redirected to the original post.
-Please create an issue on git.facebed.com with this link AFTER you have confirmed that is is accessible in incognito mode.'''
-        return format_error_message_embed(z, f'{WWWFB}/{path}')
+        return format_error_message_embed(f'{WWWFB}/{path}')
 
 
 @app.route('/favicon.ico')
