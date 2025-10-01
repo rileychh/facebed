@@ -522,19 +522,18 @@ class ReelsParser:
         html_parser = BeautifulSoup(http_response.text, 'html.parser')
         content_node = ReelsParser.get_content_node(html_parser)
 
-        video_meta = content_node['attachments'][0]['media']
-
         video_link = ReelsParser.get_video_link(html_parser)
         video_id = content_node['id']
-        is_ig = video_meta['owner']['__typename'].startswith('InstagramUser')
-        op_name = ('📷 @' if is_ig else '') + video_meta['owner']['username' if is_ig else 'name']
-        post_url = video_meta['shareable_url']
+        owner_info = content_node['short_form_video_context']['video_owner']
+        is_ig = owner_info['__typename'].startswith('InstagramUser')
+        op_name = ('📷 @' if is_ig else '') + owner_info['username' if is_ig else 'name']
+        post_url = content_node['short_form_video_context']['shareable_url']
         post_date = content_node['creation_time']
-        post_text = content_node['message']['text'] if content_node['message'] is not None else ''
+        post_text = content_node['message']['text']
 
         likes, cmts, shares = ReelsParser.get_reaction_counts(html_parser, is_ig, video_id)
 
-        if video_meta['owner']['id'] in config['banned_users']:
+        if owner_info['id'] in config['banned_users']:
             return banned(post_url)
 
         return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
@@ -633,6 +632,7 @@ def format_reel_post_embed(post: ParsedPost) -> str:
             <title>{get_credit()}</title>
             <meta charset="UTF-8"/>
             <meta property="og:title" content="{escape(post.author_name)}"/>
+            <meta property="og:description" content="{escape(post.text[:1024])}"/>
             <meta property="og:site_name" content="{get_credit()}\n{post_date}\n{reaction_str}"/>
             <meta property="og:url" content="{quote(post.url)}"/>
             <meta property="og:video:type" content="video/mp4"/>
