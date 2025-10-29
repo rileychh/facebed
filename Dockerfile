@@ -1,13 +1,13 @@
-FROM python:3.13-alpine AS builder
+FROM python:3.14-alpine AS builder
 WORKDIR /app
 COPY requirements.txt .
-RUN pip3.13 install -r ./requirements.txt
+RUN pip3.14 install -r ./requirements.txt
 
-FROM python:3.13-alpine
+FROM python:3.14-alpine
 WORKDIR /facebed
 COPY . .
 RUN /bin/sh -c "echo '{}' > ./config.yaml"
-COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 RUN adduser -D facebed
 USER facebed
-CMD ["python3.13", "./facebed.py", "-c", "./config.yaml"]
+CMD ["python3.14", "./facebed.py", "-c", "./config.yaml"]
