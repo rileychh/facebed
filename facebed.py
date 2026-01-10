@@ -10,8 +10,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta, date
-from functools import wraps, lru_cache
-from io import BytesIO
+from functools import wraps
 from typing import Self, Callable
 from urllib.parse import quote as _quote_
 from html import escape
@@ -103,7 +102,7 @@ class Utils:
 
     @staticmethod
     def human_format(num):
-        if num is int or re.match('^[0-9]+$', str(num)):
+        if isinstance(num, int) or re.match('^[0-9]+$', str(num)):
             num = int(num)
             num = float('{:.3g}'.format(num))
             magnitude = 0
