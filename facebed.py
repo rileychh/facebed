@@ -17,7 +17,6 @@ from html import escape
 from urllib.parse import urlparse
 
 import stealth_requests as requests
-import requests as rq
 import yaml
 from bottle import Bottle, request, response, static_file
 from bs4 import BeautifulSoup
@@ -60,13 +59,26 @@ def get_credit() -> str:
 class Utils:
     @staticmethod
     def resolve_share_link(path: str) -> str:
-        # cookies not needed to resolve share links
-        head_request = rq.head(f'{WWWFB}/{path}', headers=JsonParser.get_headers())
-        if head_request.next is None or head_request.next.url.startswith('https://www.facebook.com/share'):
+        # Use stealth_requests with browser impersonation to bypass Facebook's bot detection
+        try:
+            response = requests.get(
+                f'{WWWFB}/{path}',
+                headers=JsonParser.get_headers(),
+                allow_redirects=True,
+                timeout=15,
+                impersonate="chrome"
+            )
+            # Check if we got redirected successfully
+            if response.status_code != 200:
+                return ''
+            # Check if final URL is still a share link (redirect failed)
+            if response.url.startswith('https://www.facebook.com/share'):
+                return ''
+            # Extract the path from the final URL
+            path = response.url.removeprefix(f'{WWWFB}/')
+            return path
+        except Exception:
             return ''
-        path = head_request.next.url.removeprefix(f'{WWWFB}/')
-        # print(path)
-        return path
 
 
     @staticmethod
@@ -622,7 +634,7 @@ def format_reel_post_embed(post: ParsedPost) -> str:
     def get_video_meta_tag(link: str) -> str:
         return '\n'.join([
             f'<meta property="twitter:player:stream" content="{link}"/>',
-            f'<meta property="og:video" content="{link}"/>'
+            f'<meta property="og:video" content="{link}"/>',
             f'<meta property="og:video:secure_url" content="{link}"/>'
         ])
 
@@ -687,14 +699,14 @@ def process_post(post_path: str) -> str:
     parsed_post = JsonParser.process_post(post_path)
     if isinstance(parsed_post, ParsedPost):
         return format_full_post_embed(parsed_post)
-    return format_error_message_embed('Cannot process post', f'{WWWFB}/{post_path}')
+    return format_error_message_embed(f'{WWWFB}/{post_path}')
 
 
 def process_single_photo(post_path: str) -> str:
     parsed_post = SinglePhotoParser.process_post(post_path)
     if isinstance(parsed_post, ParsedPost):
         return format_full_post_embed(parsed_post)
-    return format_error_message_embed('Cannot process post', f'{WWWFB}/{post_path}')
+    return format_error_message_embed(f'{WWWFB}/{post_path}')
 
 
 @app.route('/<path:path>')
