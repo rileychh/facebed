@@ -356,8 +356,11 @@ class JsonParser:
             data_blob = Jq.first(post_json, 'data')
             if 'comet_ufi_summary_and_actions_renderer' in data_blob:   # single photo
                 return data_blob
-            else:
+            elif 'node_v2' in data_blob:
+                return data_blob['node_v2']['comet_sections']
+            elif 'node' in data_blob:
                 return data_blob['node']['comet_sections']
+            return {}
 
         def work_group_post() -> dict:
             hoisted_feed = Jq.first(post_json, 'group_hoisted_feed')
@@ -719,7 +722,7 @@ def index(path: str):
         if re.match(f'^/?reel/[0-9]+', path):
             return format_reel_post_embed(ReelsParser.process_post(path))
 
-        if re.match('^/*photo/*$', urlparse(path).path):
+        if re.match('^/*photo(\\.php)*/*$', urlparse(path).path):
             return process_single_photo(path)
 
         if re.match('^/*watch', urlparse(path).path):
