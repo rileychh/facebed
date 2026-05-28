@@ -947,6 +947,40 @@ def index(path: str):
         original_path = f"{original_path}?{request.query_string}"
         path += f'?{request.query_string}'
 
+    # /dump diagnostic: strip the suffix, fetch the page, and send raw HTML as an error report
+    if re.match(r'^(.*)/dump/?$', path, re.IGNORECASE):
+        dump_path = re.sub(r'/dump/?$', '', path, flags=re.IGNORECASE)
+        if not dump_path:
+            dump_path = ''
+        try:
+            url = JsonParser.ensure_full_url(dump_path)
+            kw = {'headers': JsonParser.get_headers()}
+            if acc.get_cookies():
+                kw['cookies'] = acc.get_cookies()
+            http_response = requests.get(url, **kw)
+            raw_html = http_response.text
+
+            filename = re.sub(r'[^a-zA-Z0-9]', '_', dump_path)[:80] + '_dump.html'
+            display_path = '/' + dump_path.lstrip('/')
+
+            embed = DiscordEmbed(
+                title="manual dump report",
+                description=f"🔗 [`{display_path}`]({url})\n📋 Manual dump requested by user",
+                color="3498DB"
+            )
+            embed.add_embed_field(name="Attached Payload", value=f"`{filename}`", inline=True)
+            embed.add_embed_field(name="Response Size", value=f"{len(raw_html)} chars", inline=True)
+            Utils.warn(file_content=raw_html.encode('utf-8'), filename=filename, embed=embed)
+
+            logging.info(f'Dump report sent for /{dump_path}')
+        except Exception:
+            logging.error(f'Failed to generate dump for /{dump_path}:\n{traceback.format_exc()}')
+
+        fb_url = f'{WWWFB}/{dump_path}'
+        response.status = 302
+        response.headers['Location'] = fb_url
+        return format_redirect_page(fb_url)
+
     # processing image in comment
     # needs priority because this returns a different link than what the user gave it
     if 'type' in request.query.dict and '3' in request.query.dict['type']:
