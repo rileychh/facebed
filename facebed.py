@@ -15,16 +15,47 @@ from functools import wraps
 from html import escape
 from typing import Self, Callable
 from urllib.parse import quote as _quote_
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import crawleruseragents
-import requests as rq
-import stealth_requests as requests
+from curl_cffi.requests import Session as CffiSession
+from curl_cffi.requests import Response as CffiResponse
 import yaml
 from bottle import Bottle, request, response, static_file
 from bs4 import BeautifulSoup
 from discord_webhook import DiscordWebhook, DiscordEmbed
 from yattag import indent
+
+
+class CFFI:
+    impersonate: str = 'chrome'
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _get_session(self) -> CffiSession:
+        sess = getattr(self._local, 'session', None)
+        if sess is None:
+            sess = CffiSession(impersonate=self.impersonate, headers=JsonParser.get_headers())
+            sess.last_request_url = None
+            self._local.session = sess
+        return sess
+
+    def get(self, url: str, **kwargs) -> CffiResponse:
+        return self._request('GET', url, **kwargs)
+
+    def head(self, url: str, **kwargs) -> CffiResponse:
+        return self._request('HEAD', url, **kwargs)
+
+    def _request(self, method: str, url: str, **kwargs) -> CffiResponse:
+        sess = self._get_session()
+        headers = dict(kwargs.pop('headers', {}))
+        if sess.last_request_url:
+            headers.setdefault('Referer', sess.last_request_url)
+        resp = sess.request(method, url, headers=headers, **kwargs)
+        parsed = urlparse(url)
+        sess.last_request_url = urlunparse(parsed._replace(query='', fragment=''))
+        return resp
 
 CONFIG_STR = '''
 host: 0.0.0.0
@@ -37,10 +68,10 @@ notifier_webhook: ''
 config: dict = {}
 default_config: dict = yaml.safe_load(io.StringIO(CONFIG_STR))
 app: Bottle = Bottle()
+cffi = CFFI()
 
 WWWFB = 'https://www.facebook.com'
 TZ_OFFSET: int = 0
-ALLOW_UPDATE = True
 logging.basicConfig(format='[%(levelname)s] [%(asctime)s] %(msg)s', level=logging.INFO)
 
 
@@ -58,11 +89,11 @@ class Utils:
     @staticmethod
     def resolve_share_link(path: str) -> str:
         url = f'{WWWFB}/{path}'
-        logging.info(f'Resolving share link: {url}')
-        head_request = rq.head(url, headers=JsonParser.get_headers(), allow_redirects=True)
-        logging.info(f'Resolved to: {head_request.url}')
+        logging.info(f'resolving share link {url}')
+        head_request = cffi.head(url, headers=JsonParser.get_headers(), allow_redirects=True)
+        logging.info(f'resolved to {head_request.url}')
         if head_request.url.startswith(('https://www.facebook.com/share', 'https://web.facebook.com/share')):
-            logging.warning('Share link still redirects to share page')
+            logging.warning('share link still going to /share')
             return ''
         
         for base in ['https://www.facebook.com', 'https://web.facebook.com']:
@@ -88,7 +119,7 @@ class Utils:
                     webhook.add_file(file=file_content, filename=filename)
                 webhook.execute()
             except Exception:
-                logging.warning(f'failed to warn about "{msg or embed}"')
+                logging.warning(f"couldn't warn about {msg or embed}")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -207,7 +238,6 @@ class Cookies:
             logging.info(f'loaded {len(self.cookies)} cookies from {fn}')
         self.get_cookies()
 
-    # noinspection PyMethodMayBeStatic
     def is_valid_cookie(self, entry: dict) -> bool:
         return int(entry.get('expirationDate', 2**31)) > time.time()
 
@@ -381,8 +411,20 @@ class JsonParser:
             'cache-control': 'no-cache',
             'pragma': 'no-cache',
             'priority': 'u=0, i',
+            'sec-ch-prefers-color-scheme': 'dark',
+            'sec-ch-ua': '"Not)A;Brand";v="8", "Chromium";v="138"',
+            'sec-ch-ua-full-version-list': '"Not)A;Brand";v="8.0.0.0", "Chromium";v="138.0.7204.300"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-model': '""',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-ch-ua-platform-version': '"19.0.0"',
+            'sec-fetch-dest': 'document',
             'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'none',
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-user': '?1',
+            'sec-gpc': '1',
+            'upgrade-insecure-requests': '1',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
         }
 
         return headers
@@ -435,7 +477,7 @@ class JsonParser:
             cookies = acc.get_cookies()
             if cookies:
                 kw['cookies'] = cookies
-        http_response = requests.get(url, **kw)
+        http_response = cffi.get(url, **kw)
         raw_html = http_response.text
         html_parser = BeautifulSoup(raw_html, 'html.parser')
         JsonParser.check_page_or_raise(html_parser, post_path)
@@ -694,8 +736,7 @@ class JsonParser:
         with JsonParser.fetch_page(post_path) as html_parser:
             post_json = JsonParser.get_root_node(JsonParser.get_post_json(html_parser))
             likes, cmts, shares = JsonParser.get_interaction_counts(post_json)
-            
-            # robust date finding
+
             post_date = -1
             t = Jq.first(post_json, 'creation_time') or Jq.first(post_json, 'created_time')
             if t:
@@ -951,7 +992,6 @@ class VideoWatchParser:
     def get_date(html_parser: BeautifulSoup) -> int:
         for json_block in JsonParser.get_json_blocks(html_parser):
             if Jq.has(json_block, 'creation_time'):
-                #   noinspection PyTypeChecker
                 return int(Jq.first(json_block, 'creation_time'))
         raise ParseException('cannot find date')
 
@@ -1108,51 +1148,51 @@ def index(path: str):
         original_path = f"{original_path}?{request.query_string}"
         path += f'?{request.query_string}'
 
-    # /dump diagnostic: strip the suffix, fetch the page, and send raw HTML as an error report
-    if re.match(r'^(.*)/dump/?$', path, re.IGNORECASE):
-        dump_path = re.sub(r'/dump/?$', '', path, flags=re.IGNORECASE)
-        if not dump_path:
-            dump_path = ''
-        try:
-            url = JsonParser.ensure_full_url(dump_path)
-            kw = {'headers': JsonParser.get_headers()}
-            if acc.get_cookies():
-                kw['cookies'] = acc.get_cookies()
-            http_response = requests.get(url, **kw)
-            raw_html = http_response.text
-
-            filename = re.sub(r'[^a-zA-Z0-9]', '_', dump_path)[:80] + '_dump.html'
-            display_path = '/' + dump_path.lstrip('/')
-
-            embed = DiscordEmbed(
-                title="manual dump report",
-                description=f"🔗 [`{display_path}`]({url})\n📋 Manual dump requested by user",
-                color="3498DB"
-            )
-            embed.add_embed_field(name="Attached Payload", value=f"`{filename}`", inline=True)
-            embed.add_embed_field(name="Response Size", value=f"{len(raw_html)} chars", inline=True)
-            Utils.warn(file_content=raw_html.encode('utf-8'), filename=filename, embed=embed)
-
-            logging.info(f'Dump report sent for /{dump_path}')
-        except Exception:
-            logging.error(f'Failed to generate dump for /{dump_path}:\n{traceback.format_exc()}')
-        
-        return process_post(dump_path)
-
-    # processing image in comment
-    # needs priority because this returns a different link than what the user gave it
-    if 'type' in request.query.dict and '3' in request.query.dict['type']:
-        try:
-            return format_full_post_embed(PhotocomParser.process_post(path))
-        except Exception:
-            pass
-
-    if not crawleruseragents.is_crawler(request.headers.get('User-Agent', '')):
-        response.status = 301
-        response.headers['Location'] = f'{WWWFB}/{path}'
-        return format_redirect_page(f'{WWWFB}/{path}')
-
     try:
+        if not crawleruseragents.is_crawler(request.headers.get('User-Agent', '')):
+            redirect_path = re.sub(r'/dump/?$', '', path, flags=re.IGNORECASE)
+            response.status = 301
+            response.headers['Location'] = f'{WWWFB}/{redirect_path}'
+            return format_redirect_page(f'{WWWFB}/{redirect_path}')
+
+        if re.match(r'^(.*)/dump/?$', path, re.IGNORECASE):
+            dump_path = re.sub(r'/dump/?$', '', path, flags=re.IGNORECASE)
+            if not dump_path:
+                dump_path = ''
+            try:
+                url = JsonParser.ensure_full_url(dump_path)
+                kw = {'headers': JsonParser.get_headers()}
+                if acc.get_cookies():
+                    kw['cookies'] = acc.get_cookies()
+                http_response = cffi.get(url, **kw)
+                raw_html = http_response.text
+
+                filename = re.sub(r'[^a-zA-Z0-9]', '_', dump_path)[:80] + '_dump.html'
+                display_path = '/' + dump_path.lstrip('/')
+
+                embed = DiscordEmbed(
+                    title="manual dump report",
+                    description=f"🔗 [`{display_path}`]({url})\n📋 Manual dump requested by user",
+                    color="3498DB"
+                )
+                embed.add_embed_field(name="Attached Payload", value=f"`{filename}`", inline=True)
+                embed.add_embed_field(name="Response Size", value=f"{len(raw_html)} chars", inline=True)
+                Utils.warn(file_content=raw_html.encode('utf-8'), filename=filename, embed=embed)
+
+                logging.info(f'dump report sent for /{dump_path}')
+            except Exception:
+                logging.error(f"couldn't dump /{dump_path}\n{traceback.format_exc()}")
+
+            return process_post(dump_path)
+
+        # processing image in comment
+        # needs priority because this returns a different link than what the user gave it
+        if 'type' in request.query.dict and '3' in request.query.dict['type']:
+            try:
+                return format_full_post_embed(PhotocomParser.process_post(path))
+            except Exception:
+                pass
+
         if re.match('^(/)?share/v/.*', path):
             path = Utils.resolve_share_link(path)
             if not path:
@@ -1184,13 +1224,13 @@ def index(path: str):
 
 
     except NoDataException:
-        logging.info(f'No data available for /{path} (login wall / restricted content)')
+        logging.info(f'no data for /{path} (login wall / restricted)')
         return format_error_message_embed(f'{WWWFB}/{path}')
     except ParseException as e:
-        logging.error(f'Parser bug for /{path}:\n{traceback.format_exc()}')
+        logging.error(f'parser bug on /{path}\n{traceback.format_exc()}')
         page_url = e.url or f'{WWWFB}/{original_path}'
         filename = re.sub(r'[^a-zA-Z0-9]', '_', path)[:80] + '.html' if e.html else None
-        
+
         display_path = '/' + original_path.lstrip('/')
         desc = f"🔗 [`{display_path}`]({page_url})\n🚩 {e}"
         if filename:
@@ -1210,10 +1250,10 @@ def index(path: str):
             Utils.warn(embed=embed)
         return format_error_message_embed(f'{WWWFB}/{path}')
     except FacebedException:
-        logging.warning(f'Unclassified FacebedException for /{path}:\n{traceback.format_exc()}')
+        logging.warning(f'weird FacebedException on /{path}\n{traceback.format_exc()}')
         return format_error_message_embed(f'{WWWFB}/{path}')
     except Exception:
-        logging.error(f'Unexpected error for /{path}:\n{traceback.format_exc()}')
+        logging.error(f'something broke on /{path}\n{traceback.format_exc()}')
         return format_error_message_embed(f'{WWWFB}/{path}')
 
 
