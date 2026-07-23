@@ -1,7 +1,7 @@
-curl_cffi~=0.15.0
-bottle~=0.13.2
-beautifulsoup4~=4.13.3
-discord-webhook~=1.4.1
-yattag~=1.16.1
-PyYAML~=6.0.2
-crawler-user-agents
+curl_cffi==0.15.0
+bottle==0.13.4
+beautifulsoup4==4.13.5
+discord-webhook==1.4.1
+yattag==1.16.1
+PyYAML==6.0.3
+crawler-user-agents==1.59.0
