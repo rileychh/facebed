@@ -233,6 +233,24 @@ cffi = CFFI()
 
 WWWFB = 'https://www.facebook.com'
 TZ_OFFSET: int = 0
+FACEBOOK_REACTION_EMOJIS = {
+    '1635855486666999': '👍',
+    '1678524932434102': '❤️',
+    '613557422527858': '🤗',
+    '115940658764963': '😂',
+    '478547315650144': '😮',
+    '908563459236466': '😢',
+    '444813342392137': '😡',
+}
+FACEBOOK_REACTION_NAME_IDS = {
+    'like': '1635855486666999',
+    'love': '1678524932434102',
+    'care': '613557422527858',
+    'haha': '115940658764963',
+    'wow': '478547315650144',
+    'sad': '908563459236466',
+    'angry': '444813342392137',
+}
 logging.basicConfig(format='[%(levelname)s] [%(asctime)s] %(message)s', level=logging.INFO)
 
 
@@ -397,8 +415,74 @@ class Utils:
             return str(num)
 
     @staticmethod
-    def format_reactions_str(likes: str, cmts: str, shares: str) -> str:
-        likes_str = f'❤️ {likes}' if likes != 'null' else ''
+    def get_top_reaction_ids(feedback: dict) -> tuple[str, ...]:
+        if not isinstance(feedback, dict):
+            return ()
+        top_reactions = feedback.get('top_reactions')
+        if not isinstance(top_reactions, dict):
+            return ()
+        edges = top_reactions.get('edges')
+        if not isinstance(edges, list):
+            return ()
+
+        ranked: list[tuple[float, int, str]] = []
+        seen_ids: set[str] = set()
+        for position, edge in enumerate(edges):
+            if not isinstance(edge, dict):
+                continue
+            node = edge.get('node')
+            if not isinstance(node, dict):
+                continue
+
+            reaction_id = str(node.get('id') or '')
+            if reaction_id not in FACEBOOK_REACTION_EMOJIS:
+                reaction_name = str(
+                    node.get('localized_name') or node.get('name') or ''
+                ).casefold()
+                reaction_id = FACEBOOK_REACTION_NAME_IDS.get(reaction_name, '')
+            if not reaction_id or reaction_id in seen_ids:
+                continue
+
+            count = edge.get('reaction_count')
+            if count is None:
+                count = edge.get('i18n_reaction_count')
+            text = str(count or '').strip().upper().replace(',', '')
+            multiplier = 1
+            if text.endswith(('K', 'M', 'B')):
+                multiplier = {
+                    'K': 1_000,
+                    'M': 1_000_000,
+                    'B': 1_000_000_000,
+                }[text[-1]]
+                text = text[:-1]
+            try:
+                numeric_count = float(text) * multiplier
+            except (TypeError, ValueError):
+                continue
+            if numeric_count <= 0:
+                continue
+
+            seen_ids.add(reaction_id)
+            ranked.append((-numeric_count, position, reaction_id))
+
+        ranked.sort()
+        reaction_ids = tuple(item[2] for item in ranked[:2])
+        return reaction_ids if len(reaction_ids) == 2 else ()
+
+    @staticmethod
+    def format_reactions_str(
+        likes: str,
+        cmts: str,
+        shares: str,
+        top_reaction_ids: tuple[str, ...] = (),
+    ) -> str:
+        emojis: list[str] = []
+        for reaction_id in top_reaction_ids:
+            emoji = FACEBOOK_REACTION_EMOJIS.get(reaction_id)
+            if emoji and emoji not in emojis:
+                emojis.append(emoji)
+        reaction_prefix = ' '.join(emojis[:2]) if len(emojis) >= 2 else '❤️'
+        likes_str = f'{reaction_prefix} {likes}' if likes != 'null' else ''
         cmts_str = f'💬 {cmts}' if cmts != 'null' else ''
         shares_str = f'🔁 {shares}' if shares != 'null' else ''
         fmt = ' • '.join([x for x in [likes_str, cmts_str, shares_str] if x]).replace(',', '.')
@@ -682,6 +766,7 @@ class ParsedPost:
     comments: str
     shares: str
     video_links: list[str]
+    top_reaction_ids: tuple[str, ...] = ()
 
 
 def banned(url: str) -> ParsedPost:
@@ -1315,10 +1400,15 @@ class JsonParser:
     def get_interaction_counts(
         post_json: dict,
         requested_ids: list[str] | None = None,
+        top_reaction_ids: list[str] | None = None,
     ) -> tuple[str, str, str]:
         assert post_json
+        if top_reaction_ids is not None:
+            top_reaction_ids.clear()
 
         def extract_counts(fb: dict) -> tuple[str, str, str]:
+            if top_reaction_ids is not None:
+                top_reaction_ids.extend(Utils.get_top_reaction_ids(fb))
             reaction_count = fb.get('reaction_count')
             if isinstance(reaction_count, dict):
                 reaction_count = reaction_count.get('count')
@@ -1648,8 +1738,9 @@ class JsonParser:
             )
             if required_ids and not JsonParser.contains_target_id(post_json, required_ids):
                 raise NoDataException('Facebook response selected a different post')
+            top_reaction_ids: list[str] = []
             likes, cmts, shares = JsonParser.get_interaction_counts(
-                post_json, requested_ids
+                post_json, requested_ids, top_reaction_ids
             )
 
             post_date = -1
@@ -1755,7 +1846,8 @@ class JsonParser:
 
             # TODO: support normal /watch here
             return ParsedPost(link_header, post_content.strip(), story.image_links, post_url, post_date,
-                              likes, cmts, shares, story.video_links)
+                              likes, cmts, shares, story.video_links,
+                              top_reaction_ids=tuple(top_reaction_ids))
 
 
 class SinglePhotoParser:
@@ -1893,14 +1985,17 @@ class SinglePhotoParser:
             post_date = content_node['created_time']
             if interaction_node is None:
                 likes, cmts, shares = '0', '0', '0'
+                top_reaction_ids: list[str] = []
             else:
+                top_reaction_ids = []
                 likes, cmts, shares = JsonParser.get_interaction_counts(
-                    interaction_node, interaction_ids
+                    interaction_node, interaction_ids, top_reaction_ids
                 )
             image_url = SinglePhotoParser.get_single_image(html_parser, requested_ids)
 
             return ParsedPost(post_author, post_text.strip(), [image_url], JsonParser.ensure_full_url(post_path),
-                              post_date, likes, cmts, shares, [])
+                              post_date, likes, cmts, shares, [],
+                              top_reaction_ids=tuple(top_reaction_ids))
 
 
 class PhotocomParser:
@@ -1938,10 +2033,24 @@ class PhotocomParser:
 
     @staticmethod
     def get_reaction_count(media_node: dict) -> int:
-        reactors = Jq.first(media_node, 'unified_reactors')
+        feedback = PhotocomParser.get_reaction_feedback(media_node)
+        reactors = feedback.get('unified_reactors')
+        if not isinstance(reactors, dict) or 'count' not in reactors:
+            reactors = Jq.first(media_node, 'unified_reactors')
         if isinstance(reactors, dict) and 'count' in reactors:
             return reactors['count']
         raise ParseException('Cannot process photocom (rc)')
+
+    @staticmethod
+    def get_reaction_feedback(media_node: dict) -> dict:
+        cur = Jq.first(media_node, 'currMedia')
+        if isinstance(cur, dict):
+            attached_comment = cur.get('attached_comment')
+            if isinstance(attached_comment, dict):
+                feedback = attached_comment.get('feedback')
+                if isinstance(feedback, dict):
+                    return feedback
+        raise ParseException('Cannot process photocom (rf)')
 
     @staticmethod
     def get_attached_image_and_url(media_node: dict) -> tuple[str, str]:
@@ -1972,8 +2081,13 @@ class PhotocomParser:
             post_time = content_node['data']['created_time']
             post_image, post_url = PhotocomParser.get_attached_image_and_url(media_node)
             reaction_count = PhotocomParser.get_reaction_count(media_node)
+            top_reaction_ids = Utils.get_top_reaction_ids(
+                PhotocomParser.get_reaction_feedback(media_node)
+            )
 
-            return ParsedPost(op_name, post_text, [post_image], post_url, post_time, Utils.human_format(reaction_count), 'null', 'null', [])
+            return ParsedPost(op_name, post_text, [post_image], post_url, post_time,
+                              Utils.human_format(reaction_count), 'null', 'null', [],
+                              top_reaction_ids=top_reaction_ids)
 
 
 class ReelsParser:
@@ -2314,12 +2428,16 @@ class VideoWatchParser:
                 if isinstance(msg, dict):
                     post_text = msg.get('text', '')
 
-            likes = Utils.human_format(content_node['feedback']['reaction_count']['count'])
+            post_feedback = content_node['feedback']
+            likes = Utils.human_format(post_feedback['reaction_count']['count'])
             shares = 'null'
-            cmts = Utils.human_format(content_node['feedback']['total_comment_count'])
+            cmts = Utils.human_format(post_feedback['total_comment_count'])
             post_date = VideoWatchParser.get_date(html_parser, content_node, requested_ids)
+            top_reaction_ids = Utils.get_top_reaction_ids(post_feedback)
 
-            return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
+            return ParsedPost(op_name, post_text, [], post_url, post_date,
+                              likes, cmts, shares, [video_link],
+                              top_reaction_ids=top_reaction_ids)
 
 
 def format_error_message_embed(original_url: str) -> str:
@@ -2363,7 +2481,9 @@ def format_reel_post_embed(post: ParsedPost) -> str:
         ])
 
     video_meta_tags = '\n'.join([get_video_meta_tag(vu) for vu in post.video_links])
-    reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
+    reaction_str = Utils.format_reactions_str(
+        post.likes, post.comments, post.shares, post.top_reaction_ids
+    )
     post_date = Utils.timestamp_to_str(post.date)
     site_name = escape(f'{get_credit()}\n{post_date}\n{reaction_str}', quote=True)
     color = '#0866ff'
@@ -2401,7 +2521,9 @@ def format_full_post_embed(post: ParsedPost) -> str:
         for iu in image_links
     ])
     post_date = Utils.timestamp_to_str(post.date)
-    reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
+    reaction_str = Utils.format_reactions_str(
+        post.likes, post.comments, post.shares, post.top_reaction_ids
+    )
     site_name = escape(
         f'{get_credit()}\n{post_date}\n{reaction_str}{image_counter}', quote=True
     )
