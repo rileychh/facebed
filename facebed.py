@@ -1319,8 +1319,14 @@ class JsonParser:
         assert post_json
 
         def extract_counts(fb: dict) -> tuple[str, str, str]:
-            reactions = fb.get('i18n_reaction_count') or Jq.first(fb, 'i18n_reaction_count') or '0'
-            shares = fb.get('i18n_share_count') or fb.get('share_count') or Jq.first(fb, 'i18n_share_count') or Jq.first(fb, 'share_count') or '0'
+            reaction_count = fb.get('reaction_count')
+            if isinstance(reaction_count, dict):
+                reaction_count = reaction_count.get('count')
+            share_count = fb.get('share_count')
+            if isinstance(share_count, dict):
+                share_count = share_count.get('count')
+            reactions = fb.get('i18n_reaction_count') or reaction_count or Jq.first(fb, 'i18n_reaction_count') or '0'
+            shares = fb.get('i18n_share_count') or share_count or Jq.first(fb, 'i18n_share_count') or Jq.first(fb, 'share_count') or '0'
             comments = fb.get('total_comment_count') or Jq.first(fb, 'total_comment_count')
             if not comments:
                 cri = fb.get('comment_rendering_instance')
@@ -1360,14 +1366,29 @@ class JsonParser:
                         best = fb
             return best
 
-        requested_ids = requested_ids or []
+        requested_ids = [str(value) for value in (requested_ids or []) if value]
+        id_keys = {
+            'id', 'video_id', 'videoid', 'post_id', 'postid', 'story_fbid',
+            'storyfbid', 'fbid', 'legacy_fbid', 'story_id', 'storyid',
+            'top_level_post_id', 'mf_story_key', 'feedback_id',
+        }
+        direct_feedback = post_json.get('feedback')
+        for identity_source in (post_json, direct_feedback):
+            if not isinstance(identity_source, dict):
+                continue
+            for key, item in identity_source.items():
+                if str(key).lower() not in id_keys:
+                    continue
+                if isinstance(item, (str, int)) and str(item):
+                    requested_ids.append(str(item))
+                elif isinstance(item, list):
+                    requested_ids.extend(
+                        str(part) for part in item
+                        if isinstance(part, (str, int)) and str(part)
+                    )
+        requested_ids = list(dict.fromkeys(requested_ids))
         if requested_ids:
             contextual_feedbacks: list[dict] = []
-            id_keys = {
-                'id', 'video_id', 'videoid', 'post_id', 'postid', 'story_fbid',
-                'storyfbid', 'fbid', 'legacy_fbid', 'story_id', 'storyid',
-                'top_level_post_id', 'mf_story_key', 'feedback_id',
-            }
 
             def walk(value, inherited_ids: set[str] | None = None) -> None:
                 inherited_ids = inherited_ids or set()
@@ -1411,7 +1432,6 @@ class JsonParser:
                         walk(item, inherited_ids)
 
             walk(post_json)
-            direct_feedback = post_json.get('feedback')
             if isinstance(direct_feedback, dict) and any(
                 marker in direct_feedback
                 for marker in (
@@ -1422,9 +1442,21 @@ class JsonParser:
             ):
                 return extract_counts(direct_feedback)
             if contextual_feedbacks:
-                def reaction_score(feedback: dict) -> int:
+                def reaction_score(feedback: dict) -> float:
+                    rc = feedback.get('reaction_count')
+                    if isinstance(rc, dict):
+                        rc = rc.get('count')
+                    if rc is None:
+                        rc = feedback.get('i18n_reaction_count')
+                    if rc is None:
+                        return -1
+                    text = str(rc).strip().upper().replace(',', '')
+                    multiplier = 1
+                    if text.endswith(('K', 'M', 'B')):
+                        multiplier = {'K': 1_000, 'M': 1_000_000, 'B': 1_000_000_000}[text[-1]]
+                        text = text[:-1]
                     try:
-                        return int(str(feedback.get('i18n_reaction_count', 0)).replace(',', ''))
+                        return float(text) * multiplier
                     except (TypeError, ValueError):
                         return 0
 
@@ -1654,6 +1686,18 @@ class JsonParser:
                     pass
 
             story = Story(story_dict)
+            parsed_post_path = urlparse(JsonParser.ensure_full_url(post_path)).path
+            if not story.video_links and re.search(
+                r'/(?:reel|watch|videos|v)(?:/|$)', parsed_post_path, re.IGNORECASE
+            ):
+                try:
+                    story.video_links.append(
+                        ReelsParser.get_video_link(
+                            html_parser, requested_ids=requested_ids
+                        )
+                    )
+                except FacebedException:
+                    pass
             canonical = html_parser.find('link', attrs={'rel': 'canonical'})
             canonical_url = str(canonical.get('href', '')) if canonical else ''
             parsed_canonical = urlparse(canonical_url)
@@ -1815,8 +1859,33 @@ class SinglePhotoParser:
                 html_parser, post_path
             )
             content_node = SinglePhotoParser.get_content_node(html_parser, requested_ids)
+            interaction_ids = list(requested_ids)
+            identity_keys = {
+                'id', 'video_id', 'post_id', 'story_fbid', 'fbid',
+                'legacy_fbid', 'top_level_post_id', 'mf_story_key', 'feedback_id',
+            }
+            identity_sources = [content_node]
+            for key in ('container_story', 'creation_story'):
+                source = Jq.first(content_node, key)
+                if isinstance(source, dict):
+                    identity_sources.append(source)
+            for source in identity_sources:
+                for key, value in source.items():
+                    if str(key).lower() in identity_keys and isinstance(value, (str, int)):
+                        text = str(value)
+                        interaction_ids.append(text)
+                        try:
+                            decoded = base64.b64decode(
+                                text + ('=' * (-len(text) % 4)), validate=True
+                            ).decode('utf-8')
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        numeric_parts = re.findall(r'\d+', decoded)
+                        if numeric_parts:
+                            interaction_ids.append(numeric_parts[-1])
+            interaction_ids = list(dict.fromkeys(interaction_ids))
             interaction_node = SinglePhotoParser.get_interactions_node(
-                html_parser, requested_ids
+                html_parser, interaction_ids
             )
 
             post_text = content_node['message']['text'] if content_node['message'] and 'text' in content_node['message'] else ''
@@ -1826,7 +1895,7 @@ class SinglePhotoParser:
                 likes, cmts, shares = '0', '0', '0'
             else:
                 likes, cmts, shares = JsonParser.get_interaction_counts(
-                    interaction_node, requested_ids
+                    interaction_node, interaction_ids
                 )
             image_url = SinglePhotoParser.get_single_image(html_parser, requested_ids)
 
@@ -1985,15 +2054,23 @@ class ReelsParser:
         raise ParseException('Invalid reels link (cn)')
 
     @staticmethod
-    def get_reaction_counts(html_parser: BeautifulSoup, is_ig: bool, video_id: str) -> tuple[str, str, str]:
+    def get_reaction_counts(
+        html_parser: BeautifulSoup,
+        is_ig: bool,
+        video_id: str,
+        related_ids: list[str] | None = None,
+    ) -> tuple[str, str, str]:
+        target_ids = list(dict.fromkeys(
+            str(value) for value in [video_id, *(related_ids or [])] if value
+        ))
         direct_blocks: list[dict] = []
         url_blocks: list[dict] = []
         for bloc in JsonParser.get_json_blocks(html_parser):
             if not Jq.has(bloc, 'unified_reactors'):
                 continue
-            if JsonParser.contains_exact_id(bloc, [str(video_id)]):
+            if JsonParser.contains_exact_id(bloc, target_ids):
                 direct_blocks.append(bloc)
-            elif JsonParser.contains_target_id(bloc, [str(video_id)]):
+            elif JsonParser.contains_target_id(bloc, target_ids):
                 url_blocks.append(bloc)
 
         blocks = direct_blocks or url_blocks
@@ -2035,33 +2112,52 @@ class ReelsParser:
         for block in blocks:
             walk(block)
 
-        target = str(video_id)
-        feedbacks = []
+        target_id_set = set(target_ids)
+        feedbacks: list[tuple[set[str], dict]] = []
         seen = set()
         for context_ids, feedback in contextual_feedbacks:
-            if target not in context_ids and not JsonParser.contains_target_id(feedback, [target]):
+            if not context_ids.intersection(target_id_set) and not JsonParser.contains_target_id(feedback, target_ids):
                 continue
             marker = id(feedback)
             if marker not in seen:
                 seen.add(marker)
-                feedbacks.append(feedback)
+                feedbacks.append((context_ids, feedback))
 
         if feedbacks:
-            first_fb = next((fb for fb in feedbacks if 'unified_reactors' in fb), feedbacks[0])
+            def unified_count(item: tuple[set[str], dict]) -> int:
+                count = item[1].get('unified_reactors', {}).get('count', 0)
+                try:
+                    return int(count)
+                except (TypeError, ValueError):
+                    return 0
+
+            first_context, first_fb = max(feedbacks, key=unified_count)
+            context_companions = [
+                feedback for context_ids, feedback in feedbacks
+                if feedback is not first_fb
+                and (not first_context or context_ids.intersection(first_context))
+            ]
+            first_feedback_id = first_fb.get('id')
+            companions = [
+                feedback for feedback in context_companions
+                if first_feedback_id and feedback.get('id') == first_feedback_id
+            ] or context_companions
             last_fb = next((
-                fb for fb in reversed(feedbacks)
-                if 'cross_universe_feedback_info' in fb
-                or 'total_comment_count' in fb
+                fb for fb in reversed(companions)
+                if 'total_comment_count' in fb
                 or 'share_count_reduced' in fb
-            ), feedbacks[-1])
+                or 'share_count' in fb
+            ), None)
+            if last_fb is None:
+                last_fb = next((
+                    fb for fb in reversed(companions)
+                    if 'cross_universe_feedback_info' in fb
+                ), first_fb)
         else:
             raise ParseException('Cannot associate reactions with requested video')
 
-        if 'cross_universe_feedback_info' in str(first_fb):
-            first_fb, last_fb = last_fb, first_fb
-
         cross_info = last_fb.get('cross_universe_feedback_info', {})
-        ig_cmts = cross_info.get('ig_comment_count', last_fb.get('total_comment_count', 0))
+        ig_cmts = cross_info.get('ig_comment_count') or last_fb.get('total_comment_count', 0)
         likes = first_fb.get('unified_reactors', {}).get('count', 0)
         cmts = ig_cmts if is_ig else last_fb.get('total_comment_count', 0)
         shares = last_fb.get('share_count_reduced', last_fb.get('share_count', 0))
@@ -2118,7 +2214,13 @@ class ReelsParser:
 
             post_text = '' if content_node.get('message') is None else content_node['message']['text']
 
-            likes, cmts, shares = ReelsParser.get_reaction_counts(html_parser, is_ig, video_id)
+            reaction_ids = [video_id, content_node.get('id'), content_node.get('post_id')]
+            content_feedback = content_node.get('feedback')
+            if isinstance(content_feedback, dict):
+                reaction_ids.append(content_feedback.get('id'))
+            likes, cmts, shares = ReelsParser.get_reaction_counts(
+                html_parser, is_ig, video_id, reaction_ids
+            )
 
             if owner_info['id'] in config['banned_users']:
                 return banned(post_url)
@@ -2436,17 +2538,28 @@ def _parse_video_path(post_path: str, http_response: CffiResponse | None = None)
     except ROUTE_FALLBACK_EXCEPTIONS as reel_error:
         if not _allow_route_upstream_fallback(reel_error):
             raise
+        generic_post = None
+        generic_error = None
         try:
-            return _invoke_parser(JsonParser.process_post, post_path, original_response)
-        except ROUTE_FALLBACK_EXCEPTIONS as generic_error:
-            if not _allow_route_upstream_fallback(generic_error):
+            generic_post = _invoke_parser(
+                JsonParser.process_post, post_path, original_response
+            )
+            if generic_post.video_links:
+                return generic_post
+        except ROUTE_FALLBACK_EXCEPTIONS as error:
+            generic_error = error
+            if not _allow_route_upstream_fallback(error):
                 raise
-            try:
-                return _invoke_parser(VideoWatchParser.process_post, post_path, original_response)
-            except ROUTE_FALLBACK_EXCEPTIONS as watch_error:
-                raise _prefer_parser_error(
-                    _prefer_parser_error(reel_error, generic_error), watch_error
-                )
+        try:
+            return _invoke_parser(
+                VideoWatchParser.process_post, post_path, original_response
+            )
+        except ROUTE_FALLBACK_EXCEPTIONS as watch_error:
+            if generic_post is not None:
+                return generic_post
+            raise _prefer_parser_error(
+                _prefer_parser_error(reel_error, generic_error), watch_error
+            )
 
 
 def _dispatch_post(post_path: str, http_response: CffiResponse | None = None) -> ParsedPost:
