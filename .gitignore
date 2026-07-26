@@ -164,7 +164,9 @@ debug.*
 .DS_Store
 
 cookies.txt
-cookies.json
+cookies*.json
+useragents.json
+.tokensave/
 samples
 jk
 test*

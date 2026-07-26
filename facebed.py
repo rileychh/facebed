@@ -3,8 +3,11 @@ import base64
 import io
 import json
 import logging
+import math
 import os
+import queue
 import re
+import signal
 import sys
 import threading
 import time
@@ -13,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from functools import wraps
-from html import escape
+from html import escape, unescape
 from pathlib import Path
 from typing import Self, Callable
 from urllib.parse import quote as _quote_
@@ -30,12 +33,34 @@ from discord_webhook import DiscordWebhook, DiscordEmbed
 from yattag import indent
 
 
+DEFAULT_FACEBOOK_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
+SHARE_HEAD_USER_AGENT = 'python-requests/2.32.3'
+SHARE_BODY_USER_AGENT = 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)'
+
+
 class FacebedException(Exception):
     pass
 
 
 class NoDataException(FacebedException):
     pass
+
+
+class UnsupportedRouteException(NoDataException):
+    pass
+
+
+class ShareResolutionException(NoDataException):
+    def __init__(
+        self,
+        message: str,
+        response: CffiResponse | None = None,
+        count_as_error: bool = False,
+    ):
+        super().__init__(message)
+        self.upstream_response = response
+        self.count_as_error = count_as_error
+        self.account_backed = False
 
 
 class ParseException(FacebedException):
@@ -46,9 +71,17 @@ class ParseException(FacebedException):
 
 
 class UpstreamException(FacebedException):
-    def __init__(self, message: str, response: CffiResponse | None = None):
+    def __init__(
+        self,
+        message: str,
+        response: CffiResponse | None = None,
+        transport_error: bool | None = None,
+    ):
         super().__init__(message)
         self.upstream_response = response
+        self.transport_error = (
+            response is None if transport_error is None else transport_error
+        )
         self.status_code = getattr(response, 'status_code', None)
         self.retry_after = None
         if response is not None:
@@ -65,17 +98,26 @@ class CFFI:
         self._local = threading.local()
 
     @contextmanager
-    def request_scope(self):
+    def request_scope(self, account=None):
         if getattr(self._local, 'session', None) is not None:
             yield self._local.session
             return
 
+        session_headers = JsonParser.get_headers()
+        session_headers = {
+            key: value
+            for key, value in session_headers.items()
+            if not key.lower().startswith('sec-ch-')
+        }
+        session_headers['user-agent'] = DEFAULT_FACEBOOK_USER_AGENT
         session = CffiSession(
             impersonate=self.impersonate,
-            headers=JsonParser.get_headers(),
+            default_headers=False,
+            headers=session_headers,
             discard_cookies=True,
         )
         self._local.session = session
+        self._local.account = account
         self._local.get_cache = {}
         self._local.responses = []
         self._local.last_get_response = None
@@ -87,8 +129,8 @@ class CFFI:
                 session.close()
             finally:
                 for attr in (
-                    'session', 'get_cache', 'responses', 'last_get_response',
-                    'selected_get_response',
+                    'session', 'account', 'get_cache', 'responses', 'last_get_response',
+                    'selected_get_response', 'affinity_path',
                 ):
                     if hasattr(self._local, attr):
                         delattr(self._local, attr)
@@ -103,6 +145,17 @@ class CFFI:
     @property
     def selected_get_response(self) -> CffiResponse | None:
         return getattr(self._local, 'selected_get_response', None)
+
+    @property
+    def current_account(self):
+        return getattr(self._local, 'account', None)
+
+    @property
+    def affinity_path(self) -> str | None:
+        return getattr(self._local, 'affinity_path', None)
+
+    def set_affinity_path(self, path: str) -> None:
+        self._local.affinity_path = path
 
     def select_response(self, response: CffiResponse | None) -> None:
         if response is not None:
@@ -124,7 +177,10 @@ class CFFI:
         check_status = kwargs.pop('_check_status', True)
         retry_status_responses = kwargs.pop('_retry_status_responses', True)
         bypass_cache = kwargs.pop('_bypass_cache', False)
+        use_cookies = kwargs.pop('_use_cookies', True)
+        kwargs.pop('cookies', None)
         headers = dict(kwargs.pop('headers', {}))
+        headers = self._request_headers(url, headers, use_cookies)
         kwargs.setdefault('allow_redirects', True)
         kwargs.setdefault('timeout', self.timeout)
         kwargs.setdefault('max_redirects', 10)
@@ -211,8 +267,39 @@ class CFFI:
                 break
 
         raise UpstreamException(
-            f'Facebook request failed for {url}: {last_error}', last_response
+            f'Facebook request failed for {url}: {last_error}',
+            last_response,
+            transport_error=True,
         ) from last_error
+
+    def _request_headers(
+        self,
+        url: str,
+        headers: dict,
+        use_cookies: bool,
+    ) -> dict:
+        account = getattr(self._local, 'account', None)
+        hostname = (urlparse(url).hostname or '').lower()
+        is_facebook = hostname == 'facebook.com' or hostname.endswith('.facebook.com')
+        result = {
+            key: value
+            for key, value in headers.items()
+            if str(key).lower() != 'cookie'
+        }
+        if account is None or not use_cookies or not is_facebook:
+            return result
+        result = {
+            key: value
+            for key, value in result.items()
+            if str(key).lower() != 'user-agent'
+        }
+        result['Cookie'] = account.header_value()
+        result['User-Agent'] = (
+            account.user_agent
+            if account.user_agent is not None
+            else DEFAULT_FACEBOOK_USER_AGENT
+        )
+        return result
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -231,8 +318,31 @@ default_config: dict = yaml.safe_load(io.StringIO(CONFIG_STR))
 app: Bottle = Bottle()
 cffi = CFFI()
 
+
+class ServiceMetrics:
+    def __init__(self, started_at: float | None = None) -> None:
+        self._started_at = time.monotonic() if started_at is None else started_at
+        self._requests = 0
+        self._errors = 0
+        self._lock = threading.Lock()
+
+    def record_request(self) -> None:
+        with self._lock:
+            self._requests += 1
+
+    def record_error(self) -> None:
+        with self._lock:
+            self._errors += 1
+
+    def snapshot(self) -> tuple[int, int, int]:
+        with self._lock:
+            uptime_secs = max(0, int(time.monotonic() - self._started_at))
+            return uptime_secs, self._requests, self._errors
+
+
+service_metrics = ServiceMetrics()
+
 WWWFB = 'https://www.facebook.com'
-TZ_OFFSET: int = 0
 FACEBOOK_REACTION_EMOJIS = {
     '1635855486666999': '👍',
     '1678524932434102': '❤️',
@@ -289,62 +399,187 @@ class Utils:
         return bool(re.match(r'^/?share(?:/|$)', urlparse(path).path, re.IGNORECASE))
 
     @staticmethod
+    def is_group_landing_target(path: str) -> bool:
+        normalized_path = urlparse(JsonParser.ensure_full_url(path)).path.strip('/')
+        return normalized_path.startswith('groups/') and (
+            normalized_path.endswith('/about')
+            or len(normalized_path.split('/')) <= 2
+        )
+
+    @staticmethod
     def resolve_share_link(path: str) -> tuple[str, CffiResponse | None]:
         with cffi.request_scope():
-            return Utils._resolve_share_link(path)
+            try:
+                resolved_path, prefetched_response = Utils._resolve_share_link(path)
+                resolved_url = JsonParser.ensure_full_url(resolved_path)
+                if not urlparse(resolved_url).path.strip('/'):
+                    raise ShareResolutionException(
+                        'Facebook share resolution did not produce a post target'
+                    )
+                return resolved_path, prefetched_response
+            except ShareResolutionException:
+                raise
+            except (NoDataException, UpstreamException) as exc:
+                raise ShareResolutionException(
+                    str(exc),
+                    getattr(exc, 'upstream_response', None),
+                    count_as_error=(
+                        isinstance(exc, UpstreamException)
+                        and exc.transport_error
+                    ),
+                ) from exc
 
     @staticmethod
     def _resolve_share_link(path: str) -> tuple[str, CffiResponse | None]:
         source_path = Utils.normalize_facebook_path(path)
         url = JsonParser.ensure_full_url(source_path)
+        is_share_v = urlparse(source_path).path.strip('/').startswith('share/v/')
         logging.info(f'resolving share link {url}')
         head_response = None
         try:
-            head_response = cffi.head(url, _check_status=False)
+            head_response = cffi.head(
+                url,
+                headers={'User-Agent': SHARE_HEAD_USER_AGENT},
+                _check_status=False,
+            )
         except UpstreamException as exc:
             logging.warning('share HEAD failed for %s: %s', url, exc)
 
         needs_get = head_response is None
         if head_response is not None:
-            head_path = Utils.normalize_facebook_path(str(head_response.url))
-            head_url_path = urlparse(str(head_response.url)).path.lower()
+            head_url = str(head_response.url)
+            head_path = Utils.normalize_facebook_path(head_url)
+            parsed_head_url = urlparse(head_url)
+            head_url_path = parsed_head_url.path.lower()
+            head_hostname = (parsed_head_url.hostname or '').lower()
+            head_is_facebook = (
+                head_hostname == 'facebook.com'
+                or head_hostname.endswith('.facebook.com')
+            )
+            normalized_head_path = head_url_path.strip('/')
+            head_is_group_landing = Utils.is_group_landing_target(head_path)
+            head_is_post_like = (
+                normalized_head_path.startswith('watch')
+                or normalized_head_path.startswith('reel/')
+                or '/videos/' in normalized_head_path
+                or (
+                    normalized_head_path.startswith('groups/')
+                    and (
+                        '/permalink/' in normalized_head_path
+                        or '/posts/' in normalized_head_path
+                    )
+                )
+            )
+            head_usable = (
+                head_is_facebook
+                and not head_is_group_landing
+                and (not is_share_v or head_is_post_like)
+            )
             needs_get = (
                 head_response.status_code >= 400
                 or Utils.is_share_path(head_path)
                 or head_url_path.startswith('/login')
+                or not head_usable
             )
             if not needs_get:
                 logging.info(f'resolved to {head_response.url}')
                 return head_path, None
 
         def inspect_direct(response: CffiResponse):
-            direct_url = str(response.url)
-            direct_path = Utils.normalize_facebook_path(direct_url)
-            direct_url_path = urlparse(direct_url).path
+            response_url = str(response.url)
+            parsed_response_url = urlparse(response_url)
+            response_host = (parsed_response_url.hostname or '').lower()
+            response_is_facebook = (
+                response_host == 'facebook.com'
+                or response_host.endswith('.facebook.com')
+            )
+            direct_url = response_url
             html_parser = BeautifulSoup(response.text, 'html.parser')
-            page_type = JsonParser.probe_page_type(html_parser, direct_path)
-            if page_type != 'has_data' and source_path != direct_path:
-                page_type = JsonParser.probe_page_type(html_parser, source_path)
-            return direct_url, direct_path, direct_url_path, page_type
+            canonical_candidates = []
+            canonical_link = html_parser.select_one('link[rel="canonical"]')
+            if canonical_link and canonical_link.get('href'):
+                canonical_candidates.append(str(canonical_link['href']))
+            for canonical_meta in html_parser.select('meta[property="og:url"]'):
+                if canonical_meta and canonical_meta.get('content'):
+                    canonical_candidates.append(str(canonical_meta['content']))
+            declared_target = False
+            for canonical_url in canonical_candidates:
+                candidate_url = JsonParser.ensure_full_url(canonical_url)
+                candidate_path = Utils.normalize_facebook_path(candidate_url)
+                parsed_candidate = urlparse(candidate_url)
+                candidate_host = (parsed_candidate.hostname or '').lower()
+                candidate_is_facebook = (
+                    candidate_host == 'facebook.com'
+                    or candidate_host.endswith('.facebook.com')
+                )
+                candidate_path_only = parsed_candidate.path.strip('/')
+                candidate_first_segment = candidate_path_only.partition('/')[0].lower()
+                candidate_page = candidate_first_segment.removesuffix('.php')
+                candidate_is_usable = (
+                    bool(candidate_path_only)
+                    and not Utils.is_share_path(candidate_path)
+                    and candidate_page not in {'login', 'checkpoint', 'recover'}
+                    and not Utils.is_group_landing_target(candidate_path)
+                )
+                if candidate_is_facebook and candidate_is_usable:
+                    direct_url = candidate_url
+                    declared_target = True
+                    break
+            direct_path = Utils.normalize_facebook_path(direct_url)
+            page_type = 'unknown'
+            if response_is_facebook:
+                page_type = JsonParser.probe_page_type(html_parser, direct_path)
+                if page_type != 'has_data' and source_path != direct_path:
+                    page_type = JsonParser.probe_page_type(html_parser, source_path)
+            return (
+                direct_url,
+                direct_path,
+                page_type,
+                declared_target,
+                response_is_facebook,
+            )
 
         direct_response = cffi.get(
             url,
+            headers={'User-Agent': SHARE_BODY_USER_AGENT},
             _check_status=False,
             _retry_status_responses=False,
         )
-        direct_url, direct_path, direct_url_path, page_type = inspect_direct(direct_response)
+        (
+            direct_url,
+            direct_path,
+            page_type,
+            declared_target,
+            response_is_facebook,
+        ) = inspect_direct(direct_response)
         if (
             page_type != 'has_data'
             and direct_response.status_code in cffi.retry_statuses
         ):
             direct_response = cffi.get(
                 url,
+                headers={'User-Agent': SHARE_BODY_USER_AGENT},
                 _check_status=False,
                 _retry_status_responses=False,
                 _bypass_cache=True,
             )
-            direct_url, direct_path, direct_url_path, page_type = inspect_direct(direct_response)
+            (
+                direct_url,
+                direct_path,
+                page_type,
+                declared_target,
+                response_is_facebook,
+            ) = inspect_direct(direct_response)
+        response_url_path = urlparse(str(direct_response.url)).path
         logging.info(f'resolved to {direct_url}')
+        if not response_is_facebook:
+            if declared_target:
+                if Utils.is_group_landing_target(direct_path):
+                    raise NoDataException(
+                        'Facebook resolved share link to a group landing page'
+                    )
+                return direct_path, None
+            raise NoDataException('Facebook redirected share link outside Facebook')
         if direct_response.status_code >= 400 and page_type != 'has_data':
             raise UpstreamException(
                 f'Facebook returned HTTP {direct_response.status_code} for {url}', direct_response
@@ -353,17 +588,13 @@ class Utils:
             if page_type == 'has_data':
                 return source_path, direct_response
             raise NoDataException('Facebook left the share URL unresolved without post data')
-        if direct_url_path.lower().startswith('/login'):
+        if response_url_path.lower().startswith('/login'):
             if page_type == 'has_data':
                 return source_path, direct_response
             raise NoDataException('Facebook redirected share link to login')
 
-        parsed_direct = urlparse(direct_url)
-        direct_host = (parsed_direct.hostname or '').lower()
-        if direct_host and direct_host != 'facebook.com' and not direct_host.endswith('.facebook.com'):
-            if page_type == 'has_data':
-                return source_path, direct_response
-            raise NoDataException('Facebook redirected share link outside Facebook')
+        if Utils.is_group_landing_target(direct_path):
+            raise NoDataException('Facebook resolved share link to a group landing page')
         return direct_path, direct_response if page_type == 'has_data' else None
 
     @staticmethod
@@ -387,11 +618,6 @@ class Utils:
                 logging.warning(f"couldn't warn about {msg or embed}")
 
         threading.Thread(target=worker, daemon=True).start()
-
-    @staticmethod
-    def d(o, no):
-        with open(f'test{no}.json', 'w', encoding='utf-8') as f:
-            f.write(json.dumps(o, ensure_ascii=False, indent=2))
 
     @staticmethod
     def timestamp_to_str(ts: int) -> str:
@@ -551,82 +777,433 @@ class Jq:
                 return False
         return True
 
-    @staticmethod
-    def last(obj: dict, key: str) -> dict:
-        return Jq.iterate(obj, key)[-1]
+@dataclass(frozen=True)
+class CookieEntry:
+    name: str
+    value: str
+    expiration_date: float | None = None
 
 
-class Cookies:
-    def __init__(self, fn: str):
-        self.fn = Path(fn)
-        self.cookies: list = []
-        self._signature = object()
-        self._warned_signature = None
-        self._lock = threading.Lock()
-        self._reload_if_changed()
+class CookieAccount:
+    def __init__(
+        self,
+        label: str,
+        entries: list[CookieEntry],
+        user_agent: str | None = None,
+    ) -> None:
+        self.label = label
+        self.entries = entries
+        self.user_agent = user_agent
+        self._cookie_header = '; '.join(f'{entry.name}={entry.value}' for entry in entries)
 
-    def _file_signature(self):
+    def header_value(self) -> str:
+        return self._cookie_header
+
+    def any_expired(self) -> bool:
+        now = time.time()
+        return any(
+            entry.expiration_date is not None and entry.expiration_date <= now
+            for entry in self.entries
+        )
+
+
+ACCOUNT_COOLDOWN_SECS = 300
+RATE_LIMIT_COOLDOWN_SECS = 60
+RATE_LIMIT_COOLDOWN_MAX_SECS = 600
+CHECKPOINT_COOLDOWN_SECS = 1800
+AFFINITY_CAP = 1024
+NOTIFY_FAILURE_THRESHOLD = 3
+
+
+class CookieJar:
+    def __init__(self, accounts: list[CookieAccount] | None = None) -> None:
+        self.accounts = list(accounts or [])
+        self._cooldown_until = [0.0] * len(self.accounts)
+        self._consecutive_failures = [0] * len(self.accounts)
+        self._affinity: dict[str, int] = {}
+        self._state_lock = threading.Lock()
+
+    @classmethod
+    def load(cls, path: Path | str) -> Self:
+        cookie_path = Path(path)
+        accounts: list[CookieAccount] = []
+        seen: set[Path] = set()
+
+        def load_one(candidate: Path) -> None:
+            canonical = candidate.resolve()
+            if canonical in seen:
+                return
+            seen.add(canonical)
+            try:
+                accounts.extend(cls._load_file(candidate))
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                logging.warning('failed to load %s: %s', candidate, exc)
+
+        if cookie_path.exists():
+            load_one(cookie_path)
+        else:
+            logging.warning('%s not found', cookie_path)
+
+        parent = cookie_path.parent
         try:
-            stat = self.fn.stat()
-            return stat.st_mtime_ns, stat.st_size
-        except OSError:
-            return None
-
-    def _reload_if_changed(self) -> None:
-        signature = self._file_signature()
-        if signature == self._signature:
-            return
-
-        self._signature = signature
-        self._warned_signature = None
-        if signature is None:
-            self.cookies = []
-            logging.warning(
-                '%s not found or unreadable, non incognito-viewable posts will NOT work',
-                self.fn.name,
+            siblings = sorted(
+                candidate
+                for candidate in parent.iterdir()
+                if candidate.is_file()
+                and candidate.name.startswith('cookies')
+                and candidate.name.endswith('.json')
+                and candidate.name != 'cookies.example.json'
             )
-            return
+        except OSError as exc:
+            logging.warning('could not scan %s for cookie files: %s', parent, exc)
+            siblings = []
+        for sibling in siblings:
+            load_one(sibling)
 
-        try:
-            with self.fn.open(encoding='utf-8') as f:
-                loaded = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            self.cookies = []
-            logging.warning("couldn't load %s: %s", self.fn, exc)
-            return
+        user_agents = cls._load_useragents(parent)
+        for account in accounts:
+            if account.user_agent is None and account.label in user_agents:
+                account.user_agent = user_agents[account.label]
 
-        self.cookies = loaded if isinstance(loaded, list) else []
-        logging.info(f'loaded {len(self.cookies)} cookies from {self.fn}')
+        cls._log_accounts(accounts)
+        if not accounts:
+            logging.warning('no cookies loaded, non incognito-viewable posts will NOT work')
+        return cls(accounts)
 
-    def is_valid_cookie(self, entry: dict) -> bool:
-        if not isinstance(entry, dict) or 'name' not in entry or 'value' not in entry:
-            return False
-        expiration = entry.get('expirationDate', 2**31)
-        if expiration in (None, ''):
-            return True
-        try:
-            return float(expiration) > time.time()
-        except (TypeError, ValueError):
-            return False
+    @classmethod
+    def load_strict(cls, path: Path | str) -> Self:
+        cookie_path = Path(path)
+        parent = cookie_path.parent
+        candidates = [cookie_path] if cookie_path.exists() else []
+        candidates.extend(
+            sorted(
+                candidate
+                for candidate in parent.iterdir()
+                if candidate.is_file()
+                and candidate.name.startswith('cookies')
+                and candidate.name.endswith('.json')
+                and candidate.name != 'cookies.example.json'
+            )
+        )
+        accounts: list[CookieAccount] = []
+        seen: set[Path] = set()
+        for candidate in candidates:
+            canonical = candidate.resolve()
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            accounts.extend(cls._load_file(candidate))
+        user_agents = cls._load_useragents(parent)
+        for account in accounts:
+            if account.user_agent is None and account.label in user_agents:
+                account.user_agent = user_agents[account.label]
+        cls._log_accounts(accounts)
+        return cls(accounts)
 
-    def get_cookies(self) -> dict[str, str]:
-        with self._lock:
-            self._reload_if_changed()
-            valid_cookies = [cookie for cookie in self.cookies if self.is_valid_cookie(cookie)]
-            expired_cookies = [cookie for cookie in self.cookies if not self.is_valid_cookie(cookie)]
-            if expired_cookies and self._warned_signature != self._signature:
-                self._warned_signature = self._signature
-                names = ', '.join(
-                    str(cookie.get('name', '?')) if isinstance(cookie, dict) else '?'
-                    for cookie in expired_cookies
+    @staticmethod
+    def _log_accounts(accounts: list[CookieAccount]) -> None:
+        for account in accounts:
+            logging.info(
+                "loaded %s cookies for account '%s'",
+                len(account.entries),
+                account.label,
+            )
+            if account.any_expired():
+                logging.info(
+                    "account '%s' has stale cookie expiration timestamps; live account check decides usability",
+                    account.label,
                 )
-                Utils.warn(f'@everyone expired cookies ignored: {names}')
 
-            return {
-                cookie['name']: cookie['value']
-                for cookie in valid_cookies
-                if 'name' in cookie and 'value' in cookie
-            }
+    @classmethod
+    def _load_file(cls, cookie_path: Path) -> list[CookieAccount]:
+        def reject_constant(value: str):
+            raise ValueError(f'non-finite JSON number: {value}')
+
+        def parse_float(value: str) -> float:
+            parsed = float(value)
+            if not math.isfinite(parsed):
+                raise ValueError(f'non-finite JSON number: {value}')
+            return parsed
+
+        loaded = json.loads(
+            cookie_path.read_text(encoding='utf-8'),
+            parse_constant=reject_constant,
+            parse_float=parse_float,
+        )
+        if isinstance(loaded, list):
+            entries = cls._parse_entries(loaded)
+            if not entries:
+                return []
+            stem = cookie_path.stem
+            label = stem.removeprefix('cookies').lstrip('-_') or 'default'
+            return [CookieAccount(label, entries)]
+        if isinstance(loaded, dict):
+            raw_accounts = loaded.get('accounts')
+            if not isinstance(raw_accounts, list):
+                raise ValueError('accounts must be a list')
+            accounts = []
+            for raw_account in raw_accounts:
+                if not isinstance(raw_account, dict):
+                    raise ValueError('account must be an object')
+                label = raw_account.get('label')
+                if not isinstance(label, str):
+                    raise ValueError('account label must be a string')
+                user_agent = raw_account.get('user_agent', raw_account.get('userAgent'))
+                if user_agent is not None and not isinstance(user_agent, str):
+                    raise ValueError('account user agent must be a string')
+                accounts.append(
+                    CookieAccount(
+                        label,
+                        cls._parse_entries(raw_account.get('entries')),
+                        user_agent,
+                    )
+                )
+            return accounts
+        raise ValueError('unsupported cookies file shape')
+
+    @staticmethod
+    def _parse_entries(raw_entries: list) -> list[CookieEntry]:
+        if not isinstance(raw_entries, list):
+            raise ValueError('cookie entries must be a list')
+        entries = []
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                raise ValueError('cookie entry must be an object')
+            name = entry.get('name')
+            value = entry.get('value')
+            expiration = entry.get('expirationDate')
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise ValueError('cookie name and value must be strings')
+            if expiration is not None and (
+                isinstance(expiration, bool) or not isinstance(expiration, (int, float))
+            ):
+                raise ValueError('cookie expirationDate must be numeric')
+            if expiration is not None:
+                try:
+                    expiration_is_finite = math.isfinite(expiration)
+                except OverflowError:
+                    expiration_is_finite = False
+                if not expiration_is_finite:
+                    raise ValueError('cookie expirationDate must be finite')
+            entries.append(CookieEntry(name, value, expiration))
+        return entries
+
+    @staticmethod
+    def _load_useragents(parent: Path) -> dict[str, str]:
+        sidecar = parent / 'useragents.json'
+        if not sidecar.exists():
+            return {}
+        try:
+            loaded = json.loads(sidecar.read_text(encoding='utf-8'))
+            if not isinstance(loaded, dict) or not all(
+                isinstance(label, str) and isinstance(user_agent, str)
+                for label, user_agent in loaded.items()
+            ):
+                raise ValueError('useragents.json must map labels to strings')
+            return loaded
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logging.warning('failed to parse %s: %s', sidecar, exc)
+            return {}
+
+    def len(self) -> int:
+        return len(self.accounts)
+
+    def is_empty(self) -> bool:
+        return not self.accounts
+
+    def account_at(self, index: int) -> CookieAccount | None:
+        if not self.accounts:
+            return None
+        return self.accounts[index % len(self.accounts)]
+
+    def _set_cooldown(self, index: int, seconds: int) -> None:
+        if not self.accounts:
+            return
+        normalized = index % len(self.accounts)
+        self._cooldown_until[normalized] = time.time() + seconds
+
+    def mark_failed(self, index: int) -> int:
+        if not self.accounts:
+            return 0
+        normalized = index % len(self.accounts)
+        with self._state_lock:
+            self._set_cooldown(normalized, ACCOUNT_COOLDOWN_SECS)
+            self._consecutive_failures[normalized] += 1
+            return self._consecutive_failures[normalized]
+
+    def mark_rate_limited(self, index: int, retry_after: int | None) -> None:
+        if not self.accounts:
+            return
+        seconds = (
+            min(retry_after, RATE_LIMIT_COOLDOWN_MAX_SECS)
+            if retry_after is not None and retry_after >= 0
+            else RATE_LIMIT_COOLDOWN_SECS
+        )
+        with self._state_lock:
+            self._set_cooldown(index, seconds)
+
+    def mark_checkpointed(self, index: int) -> int:
+        if not self.accounts:
+            return 0
+        normalized = index % len(self.accounts)
+        with self._state_lock:
+            self._set_cooldown(normalized, CHECKPOINT_COOLDOWN_SECS)
+            self._consecutive_failures[normalized] += 1
+            return self._consecutive_failures[normalized]
+
+    def mark_ok(self, index: int) -> None:
+        if not self.accounts:
+            return
+        normalized = index % len(self.accounts)
+        with self._state_lock:
+            self._cooldown_until[normalized] = 0
+            self._consecutive_failures[normalized] = 0
+
+    def reset_failure_count(self, index: int) -> None:
+        if not self.accounts:
+            return
+        with self._state_lock:
+            self._consecutive_failures[index % len(self.accounts)] = 0
+
+    def in_cooldown(self, index: int) -> bool:
+        if not self.accounts:
+            return False
+        normalized = index % len(self.accounts)
+        return time.time() < self._cooldown_until[normalized]
+
+    def affinity_for(self, key: str) -> int | None:
+        with self._state_lock:
+            return self._affinity.get(key)
+
+    def set_affinity(self, key: str, account_index: int) -> None:
+        if not self.accounts:
+            return
+        with self._state_lock:
+            if len(self._affinity) >= AFFINITY_CAP and key not in self._affinity:
+                self._affinity.pop(next(iter(self._affinity)))
+            self._affinity[key] = account_index % len(self.accounts)
+
+    def forget_affinity(self, key: str) -> None:
+        with self._state_lock:
+            self._affinity.pop(key, None)
+
+    def account_order(self, affinity_key: str | None = None) -> list[int]:
+        now = time.time()
+        with self._state_lock:
+            healthy = [
+                index
+                for index, cooldown_until in enumerate(self._cooldown_until)
+                if now >= cooldown_until
+            ]
+            cooled = [
+                index
+                for index, cooldown_until in enumerate(self._cooldown_until)
+                if now < cooldown_until
+            ]
+            preferred = self._affinity.get(affinity_key) if affinity_key else None
+            if preferred in healthy:
+                healthy.remove(preferred)
+                healthy.insert(0, preferred)
+            return [*healthy, *cooled]
+
+
+class CookieStore:
+    def __init__(self, jar: CookieJar | None = None) -> None:
+        self._jar = jar or CookieJar()
+        self._lock = threading.Lock()
+
+    def snapshot(self) -> CookieJar:
+        with self._lock:
+            return self._jar
+
+    def replace(self, jar: CookieJar) -> None:
+        with self._lock:
+            self._jar = jar
+
+
+cookie_store = CookieStore()
+
+
+def reload_cookie_store(
+    cookie_path: Path | str,
+    store: CookieStore = cookie_store,
+) -> bool:
+    try:
+        new_jar = CookieJar.load_strict(cookie_path)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        logging.warning('cookie reload failed: %s', exc)
+        return False
+    store.replace(new_jar)
+    logging.info('reloaded %s cookie account(s)', new_jar.len())
+    return True
+
+
+class CookieReloadController:
+    _STOP = object()
+
+    def __init__(self, cookie_path: Path | str, store: CookieStore) -> None:
+        self.cookie_path = cookie_path
+        self.store = store
+        self._requests = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._run,
+            name='facebed-cookie-reload',
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def request_reload(self) -> None:
+        self._requests.put(None)
+
+    def stop(self) -> None:
+        self._requests.put(self._STOP)
+
+    def _run(self) -> None:
+        while True:
+            request = self._requests.get()
+            if request is self._STOP:
+                return
+            reload_cookie_store(self.cookie_path, self.store)
+
+
+_cookie_reload_controller_lock = threading.Lock()
+_cookie_reload_controller: CookieReloadController | None = None
+
+
+def install_cookie_reload_handler(
+    cookie_path: Path | str,
+    store: CookieStore = cookie_store,
+) -> bool:
+    global _cookie_reload_controller
+
+    if not hasattr(signal, 'SIGHUP'):
+        return False
+
+    controller = CookieReloadController(cookie_path, store)
+
+    def reload_handler(_signum, _frame) -> None:
+        controller.request_reload()
+
+    signal.signal(signal.SIGHUP, reload_handler)
+    controller.start()
+    with _cookie_reload_controller_lock:
+        previous = _cookie_reload_controller
+        _cookie_reload_controller = controller
+    if previous is not None:
+        previous.stop()
+    return True
+
+
+@dataclass(frozen=True)
+class CookieAccountCheck:
+    index: int
+    label: str
+    ok: bool
+    account_name: str | None
+    status: int | None
+    reason: str | None
 
 
 class NoCookies:
@@ -672,8 +1249,6 @@ class Story:
 
         self.text = ''
         if 'message' in story_json and story_json['message'] and 'text' in story_json['message']:
-            self.text = story_json['message']['text']
-        elif story_json.get('message') and isinstance(story_json['message'], dict) and story_json['message'].get('text'):
             self.text = story_json['message']['text']
         elif story_json.get('text') and isinstance(story_json['text'], str):
             self.text = story_json['text']
@@ -924,68 +1499,6 @@ class JsonParser:
             list(dict.fromkeys([*route_proven_ids, *raw_ids])),
             route_proven_ids,
         )
-
-    @staticmethod
-    def contains_requested_id(
-        value,
-        requested_ids: list[str],
-        field_name: str = '',
-        allow_url_fields: bool = True,
-    ) -> bool:
-        if not requested_ids:
-            return False
-        if isinstance(value, dict):
-            return any(
-                JsonParser.contains_requested_id(
-                    item,
-                    requested_ids,
-                    str(key).lower(),
-                    allow_url_fields,
-                )
-                for key, item in value.items()
-            )
-        if isinstance(value, list):
-            return any(
-                JsonParser.contains_requested_id(
-                    item,
-                    requested_ids,
-                    field_name,
-                    allow_url_fields,
-                )
-                for item in value
-            )
-        if not isinstance(value, (str, int)):
-            return False
-
-        id_fields = {
-            'id', 'video_id', 'videoid', 'post_id', 'postid', 'story_fbid', 'storyfbid', 'fbid', 'legacy_fbid',
-            'story_id', 'storyid', 'top_level_post_id', 'mf_story_key', 'feedback_id',
-        }
-        url_fields = {
-            'url', 'wwwurl', 'href', 'permalink', 'shareable_url', 'canonical_url',
-        }
-        if field_name not in id_fields and (
-            not allow_url_fields or field_name not in url_fields
-        ):
-            return False
-
-        text = str(value)
-        if field_name in url_fields:
-            if not allow_url_fields:
-                return False
-            url_ids = JsonParser.get_requested_ids(text)
-            return bool(set(requested_ids).intersection(url_ids))
-
-        for requested_id in requested_ids:
-            if text == requested_id:
-                return True
-            if requested_id.isdigit():
-                if re.search(
-                    rf'(?<![A-Za-z0-9]){re.escape(requested_id)}(?![A-Za-z0-9])',
-                    text,
-                ):
-                    return True
-        return False
 
     @staticmethod
     def contains_exact_id(value, requested_ids: list[str]) -> bool:
@@ -1560,34 +2073,6 @@ class JsonParser:
         post_feedback = Jq.first(post_json, 'comet_ufi_summary_and_actions_renderer')
         if post_feedback and isinstance(post_feedback, dict) and 'feedback' in post_feedback:
             return extract_counts(post_feedback['feedback'])
-
-        ufi_in_sections = Jq.first(post_json, 'comet_ufi_summary_and_actions_renderer')
-        if ufi_in_sections:
-            ufi_feedback = ufi_in_sections.get('feedback')
-            if isinstance(ufi_feedback, dict):
-                reactions = ufi_feedback.get('i18n_reaction_count') or Jq.first(ufi_feedback, 'i18n_reaction_count') or '0'
-                shares = ufi_feedback.get('i18n_share_count') or ufi_feedback.get('share_count') or Jq.first(ufi_feedback, 'i18n_share_count') or Jq.first(ufi_feedback, 'share_count') or '0'
-                comments = ufi_feedback.get('total_comment_count') or Jq.first(ufi_feedback, 'total_comment_count')
-                if not comments:
-                    cri = ufi_feedback.get('comment_rendering_instance')
-                    if isinstance(cri, dict):
-                        cnode = cri.get('comments')
-                        if isinstance(cnode, dict):
-                            comments = cnode.get('total_count')
-                    if not comments:
-                        ccsr = ufi_feedback.get('comments_count_summary_renderer')
-                        if isinstance(ccsr, dict):
-                            fb_inner = ccsr.get('feedback')
-                            if isinstance(fb_inner, dict):
-                                cri2 = fb_inner.get('comment_rendering_instance')
-                                if isinstance(cri2, dict):
-                                    cnode2 = cri2.get('comments')
-                                    if isinstance(cnode2, dict):
-                                        comments = cnode2.get('total_count')
-                if not comments:
-                    comments = '0'
-                if reactions != '0' or shares != '0' or comments != '0':
-                    return str(reactions), str(comments), str(shares)
 
         fb = Jq.first(post_json, 'feedback')
         if fb and isinstance(fb, dict):
@@ -2564,27 +3049,6 @@ def format_redirect_page(url: str) -> str:
 </html>''')
 
 
-def process_post(post_path: str, http_response: CffiResponse | None = None) -> str:
-    post_path = Utils.normalize_facebook_path(post_path)
-    if http_response is None:
-        parsed_post = JsonParser.process_post(post_path)
-    else:
-        parsed_post = JsonParser.process_post(post_path, http_response=http_response)
-    if type(parsed_post) == ParsedPost:
-        return format_full_post_embed(parsed_post)
-    return format_error_message_embed(f'{WWWFB}/{post_path}')
-
-
-def process_single_photo(post_path: str, http_response: CffiResponse | None = None) -> str:
-    if http_response is None:
-        parsed_post = SinglePhotoParser.process_post(post_path)
-    else:
-        parsed_post = SinglePhotoParser.process_post(post_path, http_response=http_response)
-    if type(parsed_post) == ParsedPost:
-        return format_full_post_embed(parsed_post)
-    return format_error_message_embed(f'{WWWFB}/{post_path}')
-
-
 def _invoke_parser(parser, post_path: str, http_response: CffiResponse | None = None):
     if http_response is None:
         return parser(post_path)
@@ -2684,24 +3148,39 @@ def _parse_video_path(post_path: str, http_response: CffiResponse | None = None)
             )
 
 
+def _ensure_facebook_page_target(post_path: str) -> None:
+    parsed_url = urlparse(post_path)
+    if parsed_url.netloc:
+        hostname = (parsed_url.hostname or '').lower()
+        if hostname != 'facebook.com' and not hostname.endswith('.facebook.com'):
+            raise UnsupportedRouteException('refusing to fetch non-Facebook host')
+
+
 def _dispatch_post(post_path: str, http_response: CffiResponse | None = None) -> ParsedPost:
+    _ensure_facebook_page_target(post_path)
     parsed_path = urlparse(post_path).path
     if Utils.is_share_path(post_path):
+        _mark_parser_pipeline_entry()
         return _invoke_parser(JsonParser.process_post, post_path, http_response)
     if (
         re.search(r'(?:^|/)videos/', parsed_path, re.IGNORECASE)
         or re.search(r'(?:^|/)(?:[^/]+/)?v/\d+(?:/|$)', parsed_path, re.IGNORECASE)
     ):
+        _mark_parser_pipeline_entry()
         return _parse_video_path(post_path, http_response)
     if re.match(r'^/?reel/[^/?]+', parsed_path, re.IGNORECASE):
+        _mark_parser_pipeline_entry()
         return _parse_with_generic(ReelsParser.process_post, post_path, http_response)
     if re.match(r'^/?photo(?:\.php)?/?$', parsed_path, re.IGNORECASE):
+        _mark_parser_pipeline_entry()
         return _parse_with_generic(SinglePhotoParser.process_post, post_path, http_response)
     if re.match(r'^/?watch(?:/|$)', parsed_path, re.IGNORECASE):
+        _mark_parser_pipeline_entry()
         return _parse_with_generic(VideoWatchParser.process_post, post_path, http_response)
     if is_facebook_url(post_path):
+        _mark_parser_pipeline_entry()
         return _invoke_parser(JsonParser.process_post, post_path, http_response)
-    raise NoDataException('unsupported Facebook route')
+    raise UnsupportedRouteException('unsupported Facebook route')
 
 
 def _successful_embed(parsed_post: ParsedPost) -> str:
@@ -2710,8 +3189,11 @@ def _successful_embed(parsed_post: ParsedPost) -> str:
     return format_full_post_embed(parsed_post)
 
 
-def _send_dump_report(path: str) -> None:
-    http_response = cffi.selected_get_response or cffi.last_get_response
+def _send_dump_report(
+    path: str,
+    http_response: CffiResponse | None = None,
+) -> None:
+    http_response = http_response or cffi.selected_get_response or cffi.last_get_response
     if http_response is None:
         logging.info('no body-bearing GET captured for dump /%s', path)
         return
@@ -2735,10 +3217,505 @@ def _send_dump_report(path: str) -> None:
         logging.error("couldn't dump /%s\n%s", path, traceback.format_exc())
 
 
+def _normalize_account_name(value: str) -> str | None:
+    normalized = ' '.join(unescape(value).split()).strip()
+    for suffix in (' | Facebook', ' - Facebook'):
+        if normalized.endswith(suffix):
+            normalized = normalized[:-len(suffix)].strip()
+    if not normalized:
+        return None
+    lowered = normalized.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            'facebook', 'log in', 'login', 'sign up', 'checkpoint',
+            'unsupported browser', 'privacy', 'error', 'not found',
+        )
+    ):
+        return None
+    return normalized
+
+
+def _extract_cookie_account_name(
+    html_parser: BeautifulSoup,
+    body: str = '',
+) -> str | None:
+    og_title = html_parser.select_one('meta[property="og:title"]')
+    if og_title and og_title.get('content'):
+        account_name = _normalize_account_name(str(og_title['content']))
+        if account_name:
+            return account_name
+    title = html_parser.select_one('title')
+    if title:
+        account_name = _normalize_account_name(title.get_text())
+        if account_name:
+            return account_name
+    for block in JsonParser.get_json_blocks(html_parser):
+        for candidate in Jq.enumerate(block):
+            if not isinstance(candidate, dict) or not (
+                'ACCOUNT_ID' in candidate or 'USER_ID' in candidate
+            ):
+                continue
+            for key in ('NAME', 'SHORT_NAME', 'name'):
+                value = candidate.get(key)
+                if isinstance(value, str):
+                    account_name = _normalize_account_name(value)
+                    if account_name:
+                        return account_name
+    marker = 'CurrentUserInitialData'
+    offset = 0
+    while (start := body.find(marker, offset)) >= 0:
+        window = body[start:start + 6000]
+        match = re.search(r'"NAME"\s*:\s*"((?:\\.|[^"\\])*)"', window)
+        if match:
+            try:
+                decoded = json.loads(f'"{match.group(1)}"')
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, str):
+                account_name = _normalize_account_name(decoded)
+                if account_name:
+                    return account_name
+        offset = start + len(marker)
+    return None
+
+
+def _cookie_probe_blocked_reason(
+    final_url: str,
+    body: str,
+    html_parser: BeautifulSoup,
+) -> str | None:
+    lowered_url = final_url.lower()
+    if '/login' in lowered_url:
+        return 'login redirect'
+    if '/checkpoint' in lowered_url:
+        return 'checkpoint redirect'
+    if '/recover' in lowered_url:
+        return 'account recovery redirect'
+    if 'login_data' in body or 'useCometLogInFormQuery' in body:
+        return 'login wall'
+    title = html_parser.select_one('title')
+    if title:
+        lowered_title = title.get_text().lower()
+        if 'log in' in lowered_title or 'checkpoint' in lowered_title:
+            return 'login title'
+    return None
+
+
+def check_cookie_account(jar: CookieJar, account_index: int) -> CookieAccountCheck:
+    account = jar.account_at(account_index)
+    if account is None:
+        return CookieAccountCheck(
+            account_index, f'#{account_index}', False, None, None, 'account missing'
+        )
+    try:
+        with cffi.request_scope(account):
+            http_response = cffi.get(
+                f'{WWWFB}/me',
+                _check_status=False,
+                _retry_status_responses=False,
+                _bypass_cache=True,
+            )
+    except UpstreamException as exc:
+        return CookieAccountCheck(
+            account_index,
+            account.label,
+            False,
+            None,
+            exc.status_code,
+            f'http: {exc}',
+        )
+
+    status = int(http_response.status_code)
+    try:
+        body = http_response.text
+    except Exception as exc:
+        return CookieAccountCheck(
+            account_index,
+            account.label,
+            False,
+            None,
+            status,
+            f'read body: {exc}',
+        )
+    if status < 200 or status >= 300:
+        return CookieAccountCheck(
+            account_index, account.label, False, None, status, f'status {status}'
+        )
+    html_parser = BeautifulSoup(body, 'html.parser')
+    blocked_reason = _cookie_probe_blocked_reason(
+        str(http_response.url), body, html_parser
+    )
+    if blocked_reason:
+        return CookieAccountCheck(
+            account_index, account.label, False, None, status, blocked_reason
+        )
+    account_name = _extract_cookie_account_name(html_parser, body)
+    return CookieAccountCheck(
+        account_index,
+        account.label,
+        account_name is not None,
+        account_name,
+        status,
+        None if account_name is not None else 'account name not found',
+    )
+
+
+def check_cookie_accounts(jar: CookieJar) -> list[CookieAccountCheck]:
+    return [check_cookie_account(jar, index) for index in range(jar.len())]
+
+
+def start_cookie_health_check(jar: CookieJar) -> threading.Thread | None:
+    if jar.is_empty():
+        return None
+
+    def worker() -> None:
+        bad_accounts = []
+        for check in check_cookie_accounts(jar):
+            if check.ok:
+                logging.info(
+                    "cookie account alive index=%s account='%s' name='%s' status=%s",
+                    check.index, check.label, check.account_name or '?', check.status,
+                )
+            else:
+                reason = check.reason or 'unknown'
+                logging.warning(
+                    "cookie account bad index=%s account='%s' status=%s reason=%s",
+                    check.index, check.label, check.status, reason,
+                )
+                bad_accounts.append(f'{check.label} ({reason})')
+        if bad_accounts:
+            Utils.warn(
+                '@everyone cookie account check failed: ' + ', '.join(bad_accounts)
+            )
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread
+
+
+def _cookie_scope_key(path: str) -> str | None:
+    parsed_path = urlparse(JsonParser.ensure_full_url(path)).path.strip('/')
+    if parsed_path.startswith('reel/'):
+        return 'kind/reels'
+    if parsed_path.startswith('watch'):
+        return 'kind/watch'
+    if parsed_path.startswith('groups/'):
+        parts = parsed_path.split('/')
+        if len(parts) > 1 and parts[1]:
+            return f'groups/{parts[1]}'
+    parts = parsed_path.split('/')
+    if (
+        len(parts) > 1
+        and parts[0]
+        and parts[1] in {'posts', 'videos', 'photos', 'timeline', 'reels', 'media'}
+    ):
+        return f'user/{parts[0]}'
+    return None
+
+
+_parser_pipeline_local = threading.local()
+
+
+@contextmanager
+def _parser_pipeline_scope():
+    previous = getattr(_parser_pipeline_local, 'state', None)
+    state = {'entered': False}
+    _parser_pipeline_local.state = state
+    try:
+        yield state
+    finally:
+        if previous is None:
+            delattr(_parser_pipeline_local, 'state')
+        else:
+            _parser_pipeline_local.state = previous
+
+
+def _mark_parser_pipeline_entry() -> None:
+    state = getattr(_parser_pipeline_local, 'state', None)
+    if state is not None and not state['entered']:
+        state['entered'] = True
+        service_metrics.record_request()
+
+
+def _run_tracked_cookie_attempts(
+    path: str,
+    jar: CookieJar,
+) -> tuple[str, CffiResponse | None, bool]:
+    with _parser_pipeline_scope() as state:
+        try:
+            result, selected_response = _run_cookie_attempts(path, jar)
+        except Exception as exc:
+            setattr(exc, 'parser_pipeline_entered', state['entered'])
+            raise
+        return result, selected_response, state['entered']
+
+
+def _record_scrape_error(error: Exception) -> None:
+    parser_entered = bool(getattr(error, 'parser_pipeline_entered', False))
+    if not parser_entered:
+        if isinstance(error, UnsupportedRouteException):
+            return
+        if isinstance(error, ShareResolutionException):
+            if not error.account_backed and error.count_as_error:
+                service_metrics.record_error()
+            return
+    if not parser_entered:
+        service_metrics.record_request()
+    service_metrics.record_error()
+
+
+def _record_cookie_failure(
+    jar: CookieJar,
+    account_index: int,
+    error: Exception,
+    affinity_key: str | None,
+) -> int:
+    upstream_response = getattr(error, 'upstream_response', None)
+    status = getattr(upstream_response, 'status_code', None)
+    final_url = str(getattr(upstream_response, 'url', '')).lower()
+    if status in (429, 503):
+        raw_retry_after = getattr(upstream_response, 'headers', {}).get('Retry-After')
+        try:
+            retry_after = int(str(raw_retry_after).strip())
+        except (TypeError, ValueError):
+            retry_after = None
+        if retry_after is not None and retry_after < 0:
+            retry_after = None
+        jar.mark_rate_limited(account_index, retry_after)
+        return 0
+    if '/checkpoint' in final_url or '/recover' in final_url:
+        count = jar.mark_checkpointed(account_index)
+    else:
+        count = jar.mark_failed(account_index)
+    if affinity_key and jar.affinity_for(affinity_key) == account_index:
+        jar.forget_affinity(affinity_key)
+    return count
+
+
+def _maybe_notify_bad_account(
+    jar: CookieJar,
+    account_index: int,
+    count: int,
+    error: Exception,
+) -> None:
+    if count != NOTIFY_FAILURE_THRESHOLD:
+        return
+    account = jar.account_at(account_index)
+    label = account.label if account is not None else '?'
+    Utils.warn(
+        f'@everyone account `{label}` failed {count}× in a row — cookie likely expired or checkpointed. '
+        f'Please re-export and update `cookies-{label}.json`. Last error: `{error}`'
+    )
+    jar.reset_failure_count(account_index)
+
+
+def _is_cookie_retryable(error: Exception) -> bool:
+    if isinstance(error, (NoDataException, ParseException)):
+        return True
+    if not isinstance(error, UpstreamException):
+        return False
+    upstream_response = error.upstream_response
+    if upstream_response is None:
+        return True
+    status = getattr(upstream_response, 'status_code', None)
+    final_url = str(getattr(upstream_response, 'url', '')).lower()
+    return (
+        status in CFFI.retry_statuses
+        or '/checkpoint' in final_url
+        or '/recover' in final_url
+    )
+
+
+def _run_cookie_attempts(
+    path: str,
+    jar: CookieJar,
+) -> tuple[str, CffiResponse | None]:
+    _ensure_facebook_page_target(path)
+    if jar.is_empty():
+        with cffi.request_scope():
+            try:
+                result = _handle_facebook_path(path)
+            except Exception as exc:
+                selected_response = (
+                    cffi.selected_get_response or cffi.last_get_response
+                )
+                _attach_attempt_response(exc, selected_response)
+                raise
+            return result, cffi.selected_get_response or cffi.last_get_response
+
+    if Utils.is_share_path(path) and '3' not in request.query.getall('type'):
+        return _run_share_cookie_attempts(path, jar)
+
+    affinity_key = _cookie_scope_key(path)
+    order = jar.account_order(affinity_key)
+    for position, account_index in enumerate(order):
+        account = jar.account_at(account_index)
+        with cffi.request_scope(account):
+            try:
+                result = _handle_facebook_path(path)
+            except (NoDataException, ParseException, UpstreamException) as exc:
+                if isinstance(exc, UnsupportedRouteException):
+                    raise
+                selected_response = cffi.selected_get_response or cffi.last_get_response
+                _attach_attempt_response(exc, selected_response)
+                if isinstance(exc, ShareResolutionException):
+                    exc.account_backed = True
+                    if position + 1 < len(order):
+                        continue
+                    raise
+                failure_affinity_key = _cookie_scope_key(cffi.affinity_path or path)
+                failure_count = _record_cookie_failure(
+                    jar, account_index, exc, failure_affinity_key
+                )
+                _maybe_notify_bad_account(jar, account_index, failure_count, exc)
+                if _is_cookie_retryable(exc) and position + 1 < len(order):
+                    continue
+                raise
+            except Exception as exc:
+                _attach_attempt_response(
+                    exc, cffi.selected_get_response or cffi.last_get_response
+                )
+                raise
+            selected_response = cffi.selected_get_response or cffi.last_get_response
+            success_affinity_key = _cookie_scope_key(cffi.affinity_path or path)
+        jar.mark_ok(account_index)
+        if success_affinity_key:
+            jar.set_affinity(success_affinity_key, account_index)
+        return result, selected_response
+
+    raise NoDataException('no accounts available')
+
+
+def _attach_attempt_response(
+    error: Exception,
+    selected_response: CffiResponse | None,
+) -> None:
+    if (
+        getattr(error, 'upstream_response', None) is None
+        and selected_response is not None
+    ):
+        setattr(error, 'upstream_response', selected_response)
+    setattr(error, 'selected_response', selected_response)
+
+
+def _run_share_cookie_attempts(
+    source_path: str,
+    jar: CookieJar,
+) -> tuple[str, CffiResponse | None]:
+    resolved_path = None
+    prefetched_response = None
+    resolution_selected_response = None
+    resolver_account_index = None
+    last_resolution_error = None
+
+    for account_index in jar.account_order(None):
+        account = jar.account_at(account_index)
+        with cffi.request_scope(account):
+            try:
+                candidate_path, candidate_response = Utils.resolve_share_link(
+                    source_path
+                )
+            except ShareResolutionException as exc:
+                selected_response = (
+                    cffi.selected_get_response or cffi.last_get_response
+                )
+                _attach_attempt_response(exc, selected_response)
+                exc.account_backed = True
+                last_resolution_error = exc
+                continue
+            except Exception as exc:
+                _attach_attempt_response(
+                    exc, cffi.selected_get_response or cffi.last_get_response
+                )
+                raise
+            selected_response = cffi.selected_get_response or cffi.last_get_response
+
+        resolved_path = candidate_path
+        prefetched_response = candidate_response
+        resolution_selected_response = selected_response or candidate_response
+        resolver_account_index = account_index
+        break
+
+    if resolved_path is None:
+        if last_resolution_error is not None:
+            raise last_resolution_error
+        error = ShareResolutionException('no accounts available for share resolution')
+        error.account_backed = True
+        raise error
+
+    affinity_key = _cookie_scope_key(resolved_path)
+    order = jar.account_order(affinity_key)
+    for position, account_index in enumerate(order):
+        account = jar.account_at(account_index)
+        attempt_prefetched_response = (
+            prefetched_response
+            if account_index == resolver_account_index
+            else None
+        )
+        with cffi.request_scope(account):
+            cffi.set_affinity_path(resolved_path)
+            try:
+                result = _handle_resolved_facebook_path(
+                    resolved_path,
+                    prefetched_response=attempt_prefetched_response,
+                    share_source_path=source_path,
+                )
+            except (NoDataException, ParseException, UpstreamException) as exc:
+                if isinstance(exc, UnsupportedRouteException):
+                    raise
+                selected_response = (
+                    cffi.selected_get_response
+                    or cffi.last_get_response
+                    or attempt_prefetched_response
+                    or (
+                        resolution_selected_response
+                        if account_index == resolver_account_index
+                        else None
+                    )
+                )
+                _attach_attempt_response(exc, selected_response)
+                failure_count = _record_cookie_failure(
+                    jar, account_index, exc, affinity_key
+                )
+                _maybe_notify_bad_account(
+                    jar, account_index, failure_count, exc
+                )
+                if _is_cookie_retryable(exc) and position + 1 < len(order):
+                    continue
+                raise
+            except Exception as exc:
+                _attach_attempt_response(
+                    exc,
+                    cffi.selected_get_response
+                    or cffi.last_get_response
+                    or attempt_prefetched_response,
+                )
+                raise
+            selected_response = (
+                cffi.selected_get_response
+                or cffi.last_get_response
+                or attempt_prefetched_response
+                or (
+                    resolution_selected_response
+                    if account_index == resolver_account_index
+                    else None
+                )
+            )
+
+        jar.mark_ok(account_index)
+        if affinity_key:
+            jar.set_affinity(affinity_key, account_index)
+        return result, selected_response
+
+    raise NoDataException('no accounts available')
+
+
 def _handle_facebook_path(path: str) -> str:
     prefetched_response = None
     if '3' in request.query.getall('type'):
         try:
+            _mark_parser_pipeline_entry()
             return _successful_embed(PhotocomParser.process_post(path))
         except PARSER_FALLBACK_EXCEPTIONS:
             pass
@@ -2747,6 +3724,20 @@ def _handle_facebook_path(path: str) -> str:
     if Utils.is_share_path(path):
         share_source_path = path
         path, prefetched_response = Utils.resolve_share_link(path)
+        cffi.set_affinity_path(path)
+
+    return _handle_resolved_facebook_path(
+        path,
+        prefetched_response=prefetched_response,
+        share_source_path=share_source_path,
+    )
+
+
+def _handle_resolved_facebook_path(
+    path: str,
+    prefetched_response: CffiResponse | None = None,
+    share_source_path: str | None = None,
+) -> str:
 
     try:
         parsed_post = _dispatch_post(path, prefetched_response)
@@ -2755,6 +3746,7 @@ def _handle_facebook_path(path: str) -> str:
             raise
         if share_source_path and share_source_path != path:
             try:
+                _mark_parser_pipeline_entry()
                 parsed_post = _invoke_parser(
                     JsonParser.process_post,
                     share_source_path,
@@ -2767,6 +3759,29 @@ def _handle_facebook_path(path: str) -> str:
         else:
             raise
     return _successful_embed(parsed_post)
+
+
+@app.route('/healthz')
+def healthz():
+    jar = cookie_store.snapshot()
+    uptime_secs, request_count, error_count = service_metrics.snapshot()
+    payload = {
+        'status': 'ok',
+        'uptime_secs': uptime_secs,
+        'requests': request_count,
+        'errors': error_count,
+        'cookie_accounts': jar.len(),
+        'accounts': [
+            {
+                'label': account.label,
+                'in_cooldown': jar.in_cooldown(index),
+            }
+            for index, account in enumerate(jar.accounts)
+        ],
+    }
+    response.content_type = 'application/json'
+    response.headers['Cache-Control'] = 'no-store'
+    return json.dumps(payload)
 
 
 @app.route('/<path:path>')
@@ -2788,59 +3803,73 @@ def index(path: str):
         response.headers['Location'] = f'{WWWFB}/{path}'
         return format_redirect_page(f'{WWWFB}/{path}')
 
-    with cffi.request_scope():
-        try:
-            result = _handle_facebook_path(path)
-        except UpstreamException as exc:
-            status = exc.status_code
-            if status in (403, 404):
-                response.status = 404
-            elif status in CFFI.retry_statuses or status is None or (status and status >= 500):
-                response.status = 503
-                response.headers['Retry-After'] = str(exc.retry_after or 60)
-            else:
-                response.status = 502
-            response.headers['Cache-Control'] = 'no-store'
-            logging.warning('upstream failure on /%s: %s', original_path, exc)
-            result = format_error_message_embed(f'{WWWFB}/{original_path}')
-        except NoDataException:
+    selected_response = None
+    jar = cookie_store.snapshot()
+    try:
+        result, selected_response, parser_entered = _run_tracked_cookie_attempts(
+            path, jar
+        )
+        if not parser_entered:
+            service_metrics.record_request()
+    except UpstreamException as exc:
+        _record_scrape_error(exc)
+        selected_response = getattr(exc, 'selected_response', None)
+        status = exc.status_code
+        if status in (403, 404):
             response.status = 404
-            response.headers['Cache-Control'] = 'no-store'
-            logging.info('no data for /%s (login wall / restricted)', original_path)
-            result = format_error_message_embed(f'{WWWFB}/{original_path}')
-        except ParseException as exc:
+        elif status in CFFI.retry_statuses or status is None or (status and status >= 500):
+            response.status = 503
+            response.headers['Retry-After'] = str(exc.retry_after or 60)
+        else:
             response.status = 502
-            response.headers['Cache-Control'] = 'no-store'
-            logging.error('parser bug on /%s\n%s', original_path, traceback.format_exc())
-            page_url = exc.url or f'{WWWFB}/{original_path}'
-            filename = re.sub(r'[^a-zA-Z0-9]', '_', original_path)[:80] + '.html' if exc.html else None
-            display_path = '/' + original_path.lstrip('/')
-            desc = f'🔗 [`{display_path}`]({page_url})\n🚩 {exc}'
-            if filename:
-                desc += ' and attached file'
-            embed = DiscordEmbed(title='embed failure', description=desc, color='FF0000')
-            if filename:
-                embed.add_embed_field(name='Attached Payload', value=f'`{filename}`', inline=True)
-            if exc.html:
-                Utils.warn(file_content=exc.html.encode('utf-8'), filename=filename, embed=embed)
-            else:
-                Utils.warn(embed=embed)
-            result = format_error_message_embed(f'{WWWFB}/{original_path}')
-        except FacebedException as exc:
-            response.status = 502
-            response.headers['Cache-Control'] = 'no-store'
-            logging.warning('Facebed failure on /%s\n%s', original_path, traceback.format_exc())
-            result = format_error_message_embed(f'{WWWFB}/{original_path}')
-        except Exception:
-            response.status = 502
-            response.headers['Cache-Control'] = 'no-store'
-            logging.error('something broke on /%s\n%s', original_path, traceback.format_exc())
-            result = format_error_message_embed(f'{WWWFB}/{original_path}')
+        response.headers['Cache-Control'] = 'no-store'
+        logging.warning('upstream failure on /%s: %s', original_path, exc)
+        result = format_error_message_embed(f'{WWWFB}/{original_path}')
+    except NoDataException as exc:
+        _record_scrape_error(exc)
+        selected_response = getattr(exc, 'selected_response', None)
+        response.status = 404
+        response.headers['Cache-Control'] = 'no-store'
+        logging.info('no data for /%s (login wall / restricted)', original_path)
+        result = format_error_message_embed(f'{WWWFB}/{original_path}')
+    except ParseException as exc:
+        _record_scrape_error(exc)
+        selected_response = getattr(exc, 'selected_response', None)
+        response.status = 502
+        response.headers['Cache-Control'] = 'no-store'
+        logging.error('parser bug on /%s\n%s', original_path, traceback.format_exc())
+        page_url = exc.url or f'{WWWFB}/{original_path}'
+        filename = re.sub(r'[^a-zA-Z0-9]', '_', original_path)[:80] + '.html' if exc.html else None
+        display_path = '/' + original_path.lstrip('/')
+        desc = f'🔗 [`{display_path}`]({page_url})\n🚩 {exc}'
+        if filename:
+            desc += ' and attached file'
+        embed = DiscordEmbed(title='embed failure', description=desc, color='FF0000')
+        if filename:
+            embed.add_embed_field(name='Attached Payload', value=f'`{filename}`', inline=True)
+        if exc.html:
+            Utils.warn(file_content=exc.html.encode('utf-8'), filename=filename, embed=embed)
+        else:
+            Utils.warn(embed=embed)
+        result = format_error_message_embed(f'{WWWFB}/{original_path}')
+    except FacebedException as exc:
+        _record_scrape_error(exc)
+        selected_response = getattr(exc, 'selected_response', None)
+        response.status = 502
+        response.headers['Cache-Control'] = 'no-store'
+        logging.warning('Facebed failure on /%s\n%s', original_path, traceback.format_exc())
+        result = format_error_message_embed(f'{WWWFB}/{original_path}')
+    except Exception as exc:
+        _record_scrape_error(exc)
+        response.status = 502
+        response.headers['Cache-Control'] = 'no-store'
+        logging.error('something broke on /%s\n%s', original_path, traceback.format_exc())
+        result = format_error_message_embed(f'{WWWFB}/{original_path}')
 
-        if dump_requested:
-            _send_dump_report(path)
-            response.headers['Cache-Control'] = 'no-store'
-        return result
+    if dump_requested:
+        _send_dump_report(path, selected_response)
+        response.headers['Cache-Control'] = 'no-store'
+    return result
 
 
 @app.route('/favicon.ico')
@@ -2885,6 +3914,12 @@ def main():
 
     parser = argparse.ArgumentParser(description='Facebook embed server')
     parser.add_argument('-c', '--config', type=str, help='config yaml file path')
+    parser.add_argument(
+        '--cookies',
+        type=Path,
+        default=Path('cookies.json'),
+        help='path to cookies.json (sibling cookies*.json files are auto-discovered)',
+    )
     args = parser.parse_args()
 
     if args.config:
@@ -2914,6 +3949,11 @@ def main():
     if sys.version_info.minor < 12:
         logging.error('python 3.12+ required, see https://docs.python.org/3.12/whatsnew/3.12.html#pep-701-syntactic-formalization-of-f-strings')
         exit(1)
+
+    loaded_jar = CookieJar.load(args.cookies)
+    cookie_store.replace(loaded_jar)
+    install_cookie_reload_handler(args.cookies)
+    start_cookie_health_check(loaded_jar)
 
     logging.info(f'listening on {config["host"]}:{config["port"]}')
     app.install(log_to_logger)
